@@ -1,0 +1,13 @@
+{
+  "version": "0",
+  "id": "dummy-id-for-local-tests",
+  "detail-type": "Scheduled Event",
+  "source": "aws.events",
+  "account": "454851577001",
+  "time": "2025-11-14T16:33:00Z",
+  "region": "us-east-1",
+  "resources": [
+    "arn:aws:events:YOUR_REGION:YOUR_ACCOUNT_ID:rule/bitso-orderbook-fetch-minute"
+  ],
+  "detail": {}
+}
