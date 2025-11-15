@@ -1,0 +1,20 @@
+[
+  {
+    "book": "btc_usd",
+    "timestamp_utc": "2025-11-14T23:56:14.943582+00:00",
+    "best_bid": 94500,
+    "best_ask": 94501
+  },
+  {
+    "book": "eth_usd",
+    "timestamp_utc": "2025-11-14T23:56:14.943582+00:00",
+    "best_bid": 3106.1,
+    "best_ask": 3108.2
+  },
+  {
+    "book": "sol_usd",
+    "timestamp_utc": "2025-11-14T23:56:14.943582+00:00",
+    "best_bid": 138.722,
+    "best_ask": 138.867
+  }
+]

@@ -1,0 +1,1 @@
+{"statusCode": 200, "body": {"numpy_from": "/opt/python/numpy/__init__.py", "pandas_from": "/opt/python/pandas/__init__.py", "fastparquet_from": "/opt/python/fastparquet/__init__.py", "sys_path_head": ["/var/task", "/opt/python/lib/python3.12/site-packages", "/opt/python", "/var/lang/lib/python3.12/site-packages", "/var/runtime", "/var/lang/lib/python312.zip"]}}
