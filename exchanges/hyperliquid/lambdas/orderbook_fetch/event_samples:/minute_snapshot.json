@@ -1,0 +1,26 @@
+[
+  {
+    "exchange": "hyperliquid",
+    "asset": "BTC",
+    "timestamp_utc": "2025-10-16T04:59:44.140652+00:00",
+    "minute_utc": "2025-10-16T04:59:00+00:00",
+    "best_bid": 110940,
+    "best_ask": 110941
+  },
+  {
+    "exchange": "hyperliquid",
+    "asset": "ETH",
+    "timestamp_utc": "2025-10-16T04:59:44.140652+00:00",
+    "minute_utc": "2025-10-16T04:59:00+00:00",
+    "best_bid": 3996.4,
+    "best_ask": 3996.5
+  },
+  {
+    "exchange": "hyperliquid",
+    "asset": "SOL",
+    "timestamp_utc": "2025-10-16T04:59:44.140652+00:00",
+    "minute_utc": "2025-10-16T04:59:00+00:00",
+    "best_bid": 192.36,
+    "best_ask": 192.37
+  }
+]
