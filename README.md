@@ -1,4 +1,4 @@
-# tg-capital
+# Catorce Capital
 
 Production-grade **crypto HFT bots** and **market data pipelines**.  
 Currently supports **Bitso** and **Hyperliquid**. Designed to scale to more exchanges and strategies while staying simple (prod-only).
