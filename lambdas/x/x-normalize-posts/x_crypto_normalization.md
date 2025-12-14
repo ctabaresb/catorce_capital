@@ -1,95 +1,142 @@
-# X Crypto Tweet Normalization Pipeline
+# X-Crypto: Posts Normalization Pipeline (Bronze → Silver Parquet → Athena)
 
-## Lambda: `x-crypto-normalize-posts`
+## Goal
 
-### Purpose
+Continuously extract X posts (and image URLs) for a curated set of handles, store raw API responses in **Bronze**, then run a normalizer Lambda that:
 
-Transform raw bronze X API tweet pages into clean, structured, analytics‑ready data stored in the **silver/posts** layer.  
-This Lambda acts as the bridge between noisy, scattered bronze ingestion and the unified downstream ML/analytics datasets.
-
-It:
-
-- Normalizes raw X API responses into structured JSONL rows  
-- Deduplicates tweets by `tweet_id`  
-- Enriches tweets with `handle` and expanded `photos` metadata  
-- Partitions output by **date (`dt=YYYY-MM-DD`)**  
-- Produces one atomic JSONL GZ file per partition per run  
-- Uses a **watermark (`last_run`) + safety overlap** to guarantee incremental correctness  
-- Never calls X API → completely quota‑safe  
+- reads new Bronze `.json.gz` pages,
+- normalizes posts into a tabular format,
+- writes **Parquet** files partitioned by `dt` and `hour` in **Silver**,
+- enables **Athena** (and downstream GenAI agent queries) with fast partition pruning and simple SQL.
 
 ---
 
-## Inputs
+## Data Lake Layout
 
-### Secrets
-
-#### Handle → User ID map (`USER_IDS_SECRET`)
-
-Used to enrich silver rows with user-friendly handles:
-
-```json
-{
-  "handles": ["cryptodonalt", "milkroad"],
-  "map": {
-    "cryptodonalt": "878219545785372673",
-    "milkroad": "1476696261222936577"
-  }
-}
-```
-
-The Lambda inverts this mapping internally:
+### Bronze (raw X API page responses)
+Each extraction stores a raw page response per user and request timestamp:
 
 ```
-{ "878219545785372673": "cryptodonalt", ... }
+s3://x-crypto/bronze/x_api/endpoint=users_tweets/
+  dt=YYYY-MM-DD/
+    user_id=<id>/
+      page_ts=<epoch_ms>.json.gz
 ```
+
+Example:
+
+```
+s3://x-crypto/bronze/x_api/endpoint=users_tweets/dt=2025-12-14/user_id=1073132650309726208/page_ts=1765670495830.json.gz
+```
+
+Bronze is append-only and may contain:
+- successful pages (`status=200`)
+- error pages (429/5xx), which are ignored by the normalizer
+
+---
+
+### Silver (normalized Parquet for Athena)
+The normalizer writes **Parquet** partitioned by day and hour:
+
+```
+s3://x-crypto/silver/posts_parquet/
+  dt=YYYY-MM-DD/
+    hour=HH/
+      posts-<run_ts>.parquet
+```
+
+Example:
+
+```
+s3://x-crypto/silver/posts_parquet/dt=2025-12-14/hour=17/posts-1765735169.parquet
+```
+
+This layout is **Athena-friendly** (Hive partitions), supports pruning on `dt` and `hour`, and avoids single large daily files or excessive small files.
+
+---
+
+## Normalizer Lambda
+
+### Purpose
+The Lambda `x-crypto-normalize-posts` runs on a schedule (e.g., hourly at `HH:50`) and:
+1. Reads Bronze `.json.gz` pages
+2. Extracts tweets and normalizes fields
+3. Writes to Silver as Parquet in `dt/hour` partitions
+
+### Key behaviors
+- **Incremental mode** (scheduled `{}` input):
+  - scans only relevant `dt=` prefixes around the watermark
+  - filters by `LastModified > (watermark - overlap)`
+  - appends new Parquet files
+  - advances the watermark
+
+- **Backfill mode** (manual):
+  - scans one date or last N days
+  - with overwrite enabled, deletes and rewrites partition prefixes
+  - produces deterministic outputs
+
+---
+
+## Watermark / State
+
+The normalizer uses a watermark stored in S3:
+
+- Key:
+  ```
+  bronze/state/normalizer/x_api_users_tweets_last_run_parquet.json
+  ```
+
+- Payload example:
+  ```json
+  {"last_run": "2025-12-14T17:41:42.893887Z"}
+  ```
+
+This allows scheduled runs to process only new/updated Bronze objects while supporting safe overlap.
+
+---
+
+## Safety Overlap
+
+Because S3 object `LastModified` timing can vary and X API collection may drift, the normalizer uses an overlap window:
+
+- `SAFETY_OVERLAP_S` (recommended: **3600 seconds**)
+
+On each incremental run, objects modified up to one hour before the last watermark are re-scanned.
+
+> This can cause **duplicates at the Silver layer**, which is expected and handled downstream.
 
 ---
 
 ## Environment Variables
 
-| Variable | Purpose |
-|---------|---------|
-| `S3_BUCKET` | Bucket for bronze + silver layers |
-| `BRONZE_PREFIX` | Input prefix, e.g. `bronze/x_api/endpoint=users_tweets` |
-| `SILVER_PREFIX` | Output prefix, e.g. `silver/posts` |
-| `NORMALIZER_STATE` | Stores the watermark (`last_run`) |
-| `SAFETY_OVERLAP_S` | Seconds of overlap when scanning bronze |
-| `USER_IDS_SECRET` | Secret for UID → handle mapping |
+### Required / Used
 
-### Recommended configuration
+| Key | Example | Purpose |
+|---|---|---|
+| `S3_BUCKET` | `x-crypto` | Bucket for all inputs/outputs |
+| `BRONZE_PREFIX` | `bronze/x_api/endpoint=users_tweets` | Root prefix for raw pages |
+| `OUT_PREFIX` | `silver/posts_parquet` | Output prefix for Parquet |
+| `NORMALIZER_STATE` | `bronze/state/normalizer/x_api_users_tweets_last_run_parquet.json` | Watermark location |
+| `USER_IDS_SECRET` | `prod/x-crypto/user-ids` | SecretsManager mapping handles ↔ user_ids |
+| `SAFETY_OVERLAP_S` | `3600` | Overlap window in seconds |
+| `MAX_ROWS_PER_DT` | `200000` | Cap per `dt+hour` partition |
+| `WRITE_PARQUET` | `true` | Hard safety switch |
 
-```
-S3_BUCKET=x-crypto
-BRONZE_PREFIX=bronze/x_api/endpoint=users_tweets
-SILVER_PREFIX=silver/posts
-NORMALIZER_STATE=bronze/state/normalizer/x_api_users_tweets_last_run.json
-SAFETY_OVERLAP_S=60
-USER_IDS_SECRET=prod/x-crypto/user-ids
-```
+### Legacy / Not Used (safe to remove)
+
+- `PARQUET_MODE`
+- `PARQUET_PREFIX`
+- `SILVER_PREFIX`
 
 ---
 
-## Event Scheduling
+## Scheduling
 
-Normalize after all extraction shards finish.
+### EventBridge Rule
+Runs hourly at `HH:50`.
 
-Extraction runs at:
-- HH:00  
-- HH:15  
-- HH:30  
-- HH:45  
-
-Therefore run the normalizer at:
-
-### HH:50
-
-EventBridge rule:
-
-```
-cron(50 * * * ? *)
-```
-
-Payload:
+### Scheduled input
+Use empty JSON so it runs **incremental**:
 
 ```json
 {}
@@ -97,168 +144,102 @@ Payload:
 
 ---
 
-## Execution Flow
+## Manual Operations
 
-### 1. Load UID → handle map
-Enriches tweets with `handle`.
-
----
-
-### 2. Load watermark (`last_run`)
-Located at:
-
-```
-bronze/state/normalizer/x_api_users_tweets_last_run.json
-```
-
-If missing → full historical backfill.  
-If present → incremental processing only.
-
----
-
-### 3. Scan bronze for new pages
-
-The Lambda scans:
-
-```
-bronze/x_api/endpoint=users_tweets/dt=YYYY-MM-DD/user_id=<UID>/page_ts=....json.gz
-```
-
-It processes only:
-
-- Valid `.json.gz` X API pages  
-- Files newer than `last_run - SAFETY_OVERLAP_S`  
-- Non-error pages (status != 429)
-
----
-
-### 4. Normalize
-
-For each X API page:
-
-- Skip empty pages (meta.result_count == 0)
-- Expand media via `includes.media`
-- Produce a normalized row including:
+### Backfill last 7 days and advance watermark
 
 ```json
 {
-  "tweet_id": "...",
-  "author_id": "...",
-  "handle": "cryptodonalt",
-  "created_at": "...",
-  "text": "...",
-  "photos": [...],
-  "public_metrics": {...},
-  "source_page_key": "bronze/x_api/...",
-  "ingested_at": "...",
-  "dt": "YYYY-MM-DD"
+  "backfill_days": 7,
+  "overwrite_partitions": true,
+  "advance_watermark": true
 }
 ```
 
----
-
-### 5. Deduplicate within the run
-
-Tweets are deduped via:
-
-```
-seen_ids = set()
-```
-
-This avoids double-counting tweets that appear in multiple pages or in the overlap window.
-
----
-
-### 6. Write silver output
-
-For each distinct partition `dt=YYYY-MM-DD`, write:
-
-```
-silver/posts/dt=YYYY-MM-DD/posts-<timestamp>.jsonl.gz
-```
-
-Each file is atomic and append-only.  
-Ideal for Athena/Spark queries.
-
----
-
-### 7. Save watermark
-
-Write:
+### Backfill a single day
 
 ```json
-{"last_run": "<ISO8601 timestamp>"}
+{
+  "dt": "2025-12-14",
+  "overwrite_partitions": true
+}
 ```
 
-to:
-
-```
-bronze/state/normalizer/x_api_users_tweets_last_run.json
-```
-
-This ensures the next run processes **only new** bronze pages.
-
----
-
-## S3 Structure
-
-### Bronze (input)
-
-```
-bronze/
-  x_api/
-    endpoint=users_tweets/
-      dt=YYYY-MM-DD/
-        user_id=<UID>/
-          page_ts=<TS>.json.gz
-  state/
-    normalizer/
-      x_api_users_tweets_last_run.json
-```
-
-### Silver (output)
-
-```
-silver/
-  posts/
-    dt=YYYY-MM-DD/
-      posts-<timestamp>.jsonl.gz
-```
-
----
-
-## Backfill Modes
-
-### Full Backfill (default)
-If no watermark exists → all historical bronze data is normalized.
-
-### Seeded Backfill (optional)
-You can manually set:
+### Manual incremental run (not recommended)
 
 ```json
-{"last_run": "2025-12-10T20:50:00Z"}
+{}
 ```
 
-to skip historical data and begin normalization “from now”.
+This may create duplicates due to overlap and append semantics.
 
 ---
 
-## Removing a Handle
+## Output Schema (Normalized Fields)
 
-When a handle is removed from extraction:
+Each row represents one tweet:
 
-1. Bronze stops producing pages for that UID.  
-2. Normalizer stops seeing new pages.  
-3. Old silver data remains intact.
-
-No changes required in this Lambda.
+- `tweet_id` (string)
+- `author_id` (string)
+- `handle` (string | null)
+- `created_at` (RFC3339 string)
+- `text` (string)
+- Engagement metrics:
+  - `retweet_count`
+  - `reply_count`
+  - `like_count`
+  - `quote_count`
+  - `bookmark_count`
+  - `impression_count`
+- Media:
+  - `media_keys` (array<string>)
+  - `photos` (array<struct{media_key,url,w,h}>)
+- Lineage:
+  - `source_page_key`
+  - `ingested_at`
+- Partitions (also stored as columns):
+  - `dt` (YYYY-MM-DD)
+  - `hour` (HH)
 
 ---
 
-## Notes
+## Deduplication Strategy (Athena / GenAI)
 
-- The normalizer is **idempotent**, **incremental**, and **safe for schedule-based execution**.
-- All data is neatly partitioned by `dt`, enabling efficient table scans.
-- Produces clean JSONL for ML pipelines, analytics, dashboards, and alpha research.
-- Never interacts with the X API → no risk of exceeding the monthly quota.
+Silver is append-only and **may contain duplicates** due to safety overlap and retries.
+
+Recommended consumption patterns:
+
+### Option A (recommended initially): Athena VIEW
+- Deduplicate by `tweet_id`
+- Keep the latest record by `ingested_at`
+- Agent queries the view, not raw Silver
+
+### Option B (long-term): Iceberg Gold Table
+- Periodic `MERGE` / upsert by `tweet_id`
+- Built-in compaction and snapshot isolation
+
+---
+
+## Operational Notes
+
+- **Lambda Layer:** must include `pyarrow` (AWS-managed pandas/pyarrow layer recommended)
+- **Timeout:** ≥ 5–10 minutes
+- **Memory:** 512 MB minimum; 1024 MB recommended for faster Parquet writes
+- **Concurrency:** avoid overlapping runs; reserved concurrency = 1 if strict serialization is desired
+
+---
+
+## Troubleshooting
+
+### `ModuleNotFoundError: pyarrow`
+- Layer not attached to the executed version or wrong architecture
+- Fix: attach AWS-managed `AWSSDKPandas-Python312` layer
+
+### Athena does not see partitions
+- If not using partition projection, run a crawler or `MSCK REPAIR TABLE`
+- Recommended: use **partition projection** to eliminate operational overhead
+
+---
+
+This pipeline is designed to be **idempotent for backfills**, **robust to retries**, and **optimized for Athena-first analytics and GenAI agents**.
 
