@@ -1,0 +1,24 @@
+{
+    "ActionAfterCompletion": "NONE",
+    "Arn": "arn:aws:scheduler:us-east-1:454851577001:schedule/default/x-crypto-agent-submit",
+    "CreationDate": "2026-01-09T15:56:15.922000-06:00",
+    "Description": "Scheduled and manual entry point for the crypto market intelligence pipeline.\nSubmits analysis jobs that are processed asynchronously and published to notification channelsin Telegram.",
+    "FlexibleTimeWindow": {
+        "Mode": "OFF"
+    },
+    "GroupName": "default",
+    "LastModificationDate": "2026-03-04T14:39:31.759000-06:00",
+    "Name": "x-crypto-agent-submit",
+    "ScheduleExpression": "cron(0 */2 * * ? *)",
+    "ScheduleExpressionTimezone": "America/Mexico_City",
+    "State": "DISABLED",
+    "Target": {
+        "Arn": "arn:aws:lambda:us-east-1:454851577001:function:x-crypto-posts-submit",
+        "Input": "{\n  \"time_window\": \"recent\",\n  \"max_posts\": 50,\n  \"source\": \"eventbridge\"\n}\n",
+        "RetryPolicy": {
+            "MaximumEventAgeInSeconds": 86400,
+            "MaximumRetryAttempts": 0
+        },
+        "RoleArn": "arn:aws:iam::454851577001:role/service-role/Amazon_EventBridge_Scheduler_Crypto_Agent_Submit"
+    }
+}

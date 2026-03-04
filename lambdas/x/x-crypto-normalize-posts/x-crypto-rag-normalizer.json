@@ -1,0 +1,23 @@
+{
+    "ActionAfterCompletion": "NONE",
+    "Arn": "arn:aws:scheduler:us-east-1:454851577001:schedule/default/x-crypto-rag-normalizer",
+    "CreationDate": "2025-12-10T17:47:44.460000-06:00",
+    "Description": "Normalize bronze X API users_tweets pages into partitioned silver/posts JSONL (one run per hour at HH:50, incremental via last_run watermark).",
+    "FlexibleTimeWindow": {
+        "Mode": "OFF"
+    },
+    "GroupName": "default",
+    "LastModificationDate": "2026-03-04T14:39:31.756000-06:00",
+    "Name": "x-crypto-rag-normalizer",
+    "ScheduleExpression": "cron(50 * * * ? *)",
+    "ScheduleExpressionTimezone": "America/Mexico_City",
+    "State": "DISABLED",
+    "Target": {
+        "Arn": "arn:aws:lambda:us-east-1:454851577001:function:x-crypto-normalize-posts",
+        "RetryPolicy": {
+            "MaximumEventAgeInSeconds": 86400,
+            "MaximumRetryAttempts": 0
+        },
+        "RoleArn": "arn:aws:iam::454851577001:role/service-role/Amazon_EventBridge_Scheduler_X_Crypto_S3_normalizer"
+    }
+}
