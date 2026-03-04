@@ -1,0 +1,46 @@
+{
+    "FunctionName": "x-crypto-http-authorizer",
+    "FunctionArn": "arn:aws:lambda:us-east-1:454851577001:function:x-crypto-http-authorizer",
+    "Runtime": "python3.12",
+    "Role": "arn:aws:iam::454851577001:role/x-crypto-http-authorizer-role",
+    "Handler": "lambda_function.lambda_handler",
+    "CodeSize": 2109,
+    "Description": "",
+    "Timeout": 60,
+    "MemorySize": 128,
+    "LastModified": "2026-01-06T15:34:35.000+0000",
+    "CodeSha256": "/LHVpcb3fI+p9c3YWXwM5y3FOuMjSEOnlIjAnB1Zv0U=",
+    "Version": "$LATEST",
+    "Environment": {
+        "Variables": {
+            "ALLOW_MULTIPLE_KEYS": "false",
+            "SECRET_NAME": "prod/x-crypto/x-crypto-agent-api",
+            "SECRET_JSON_FIELD": "api_key",
+            "API_KEY_HEADER": "x-api-key"
+        }
+    },
+    "TracingConfig": {
+        "Mode": "PassThrough"
+    },
+    "RevisionId": "cab29281-3eea-445f-bf4f-1aca494c13c7",
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
+    "PackageType": "Zip",
+    "Architectures": [
+        "x86_64"
+    ],
+    "EphemeralStorage": {
+        "Size": 512
+    },
+    "SnapStart": {
+        "ApplyOn": "None",
+        "OptimizationStatus": "Off"
+    },
+    "RuntimeVersionConfig": {
+        "RuntimeVersionArn": "arn:aws:lambda:us-east-1::runtime:db3c84011294fca0fe7b1a23046dff08606163e107373f3875220c35007134cf"
+    },
+    "LoggingConfig": {
+        "LogFormat": "Text",
+        "LogGroup": "/aws/lambda/x-crypto-http-authorizer"
+    }
+}

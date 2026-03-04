@@ -1,0 +1,53 @@
+{
+    "FunctionName": "x-crypto-posts-worker",
+    "FunctionArn": "arn:aws:lambda:us-east-1:454851577001:function:x-crypto-posts-worker",
+    "Runtime": "python3.12",
+    "Role": "arn:aws:iam::454851577001:role/x-crypto-posts-worker-role",
+    "Handler": "lambda_function.handler",
+    "CodeSize": 8960,
+    "Description": "",
+    "Timeout": 900,
+    "MemorySize": 128,
+    "LastModified": "2026-01-10T14:34:06.000+0000",
+    "CodeSha256": "bO4DUqXv/AepRh1M6pIAQ27zMS1LudaD0IzMlvBMa+c=",
+    "Version": "$LATEST",
+    "Environment": {
+        "Variables": {
+            "JOBS_TABLE": "x_crypto_posts_jobs",
+            "VIEW_RECENT": "v_posts_agent_recent",
+            "MIN_NONEMPTY_POSTS": "8",
+            "ATHENA_MAX_ROWS": "200",
+            "VIEW_24H": "v_posts_agent_24h",
+            "BEDROCK_MAX_TOKENS": "1200",
+            "BEDROCK_MODEL_ID": "amazon.nova-micro-v1:0",
+            "CRYPTO_AGENT_ATHENA_WORKGROUP": "primary",
+            "ATHENA_TIMEOUT_S": "600",
+            "CRYPTO_AGENT_ATHENA_DB": "x_crypto",
+            "MAX_POST_CHARS": "280"
+        }
+    },
+    "TracingConfig": {
+        "Mode": "PassThrough"
+    },
+    "RevisionId": "b6b75776-f566-4a21-af26-5819f50cd66b",
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
+    "PackageType": "Zip",
+    "Architectures": [
+        "x86_64"
+    ],
+    "EphemeralStorage": {
+        "Size": 512
+    },
+    "SnapStart": {
+        "ApplyOn": "None",
+        "OptimizationStatus": "Off"
+    },
+    "RuntimeVersionConfig": {
+        "RuntimeVersionArn": "arn:aws:lambda:us-east-1::runtime:db3c84011294fca0fe7b1a23046dff08606163e107373f3875220c35007134cf"
+    },
+    "LoggingConfig": {
+        "LogFormat": "Text",
+        "LogGroup": "/aws/lambda/x-crypto-posts-worker"
+    }
+}
