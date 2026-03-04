@@ -28,6 +28,15 @@ Fully serverless, quota-aware, cost-controlled, and integrated into a medallion 
   - **Raw OCR output** → `silver/image_text`
   - **High-signal RAG-ready chunks** → `silver/rag_docs`
 
+### 4. Post Submission & Processing
+- HTTP API entry point for post submission requests
+- Async worker decouples execution from submission
+- Status tracking layer exposes processing state to callers
+
+### 5. Alerting & Access Control
+- Telegram notifier fires high-signal alerts downstream of normalization/OCR
+- HTTP authorizer secures all API Gateway endpoints
+
 ---
 
 ## Components
@@ -71,7 +80,7 @@ Features:
 
 ---
 
-## 3. Lambda: `x-crypto-image-text` (image OCR → silver/image_text + RAG docs)
+## 3. Lambda: `x-crypto-image-text-builder` (image OCR → silver/image_text + RAG docs)
 
 **Schedule:** hourly at **HH:55**
 
@@ -126,6 +135,66 @@ silver/rag_docs/dt=YYYY-MM-DD/doc-<N>.jsonl.gz
 
 ---
 
+## 4. Lambda: `x-crypto-posts-submit` (API → submission queue)
+
+**Trigger:** API Gateway HTTP POST  
+**Purpose:** Entry point for post submission requests
+
+Handles:
+- Request validation and normalization
+- Enqueues jobs for async processing via SQS or EventBridge
+- Returns a submission ID for status polling
+
+---
+
+## 5. Lambda: `x-crypto-posts-worker` (async post processing)
+
+**Trigger:** SQS / EventBridge (async)  
+**Purpose:** Execute compute-heavy or retry-prone post processing jobs
+
+Handles:
+- Decoupled execution from the submission path
+- Retry logic and dead-letter handling
+- Writes processing results back to S3 state layer
+
+---
+
+## 6. Lambda: `x-crypto-posts-status` (processing state tracker)
+
+**Trigger:** API Gateway HTTP GET  
+**Purpose:** Expose the current processing state of a submitted post
+
+Handles:
+- Reads state from S3 or DynamoDB
+- Returns structured status response to caller (polling or webhook)
+- Designed to be low-latency and stateless
+
+---
+
+## 7. Lambda: `x-crypto-telegram-notifier` (alerting)
+
+**Trigger:** EventBridge / downstream of normalization or OCR  
+**Purpose:** Fire Telegram alerts on high-signal detected events
+
+Handles:
+- Configurable alert types (liquidations, listings, narrative shifts, OCR triggers)
+- Formats messages for Telegram Bot API
+- Reads target channels/chat IDs from Secrets Manager
+
+---
+
+## 8. Lambda: `x-crypto-http-authorizer` (API Gateway security)
+
+**Trigger:** API Gateway Lambda Authorizer  
+**Purpose:** Secure all HTTP API endpoints
+
+Handles:
+- Validates bearer tokens or API keys on every inbound request
+- Returns IAM allow/deny policy to API Gateway
+- Stateless — no side effects
+
+---
+
 ## S3 Medallion Layout (Full)
 
 ```
@@ -153,14 +222,19 @@ s3://x-crypto/
 
 ## Scheduling Summary
 
-| Component | Schedule | Purpose |
-|----------|----------|---------|
+| Component | Schedule / Trigger | Purpose |
+|---|---|---|
 | `x-crypto-tweets-to-s3` shard 0 | HH:00 | Tweet ingestion |
 | shard 1 | HH:15 | Tweet ingestion |
 | shard 2 | HH:30 | Tweet ingestion |
 | shard 3 | HH:45 | Tweet ingestion |
 | `x-crypto-normalize-posts` | HH:50 | Normalize to silver |
-| `x-crypto-image-text` | HH:55 | OCR images → silver/RAG |
+| `x-crypto-image-text-builder` | HH:55 | OCR images → silver/RAG |
+| `x-crypto-posts-submit` | API Gateway HTTP POST | Submit post for processing |
+| `x-crypto-posts-worker` | SQS / EventBridge (async) | Execute post processing jobs |
+| `x-crypto-posts-status` | API Gateway HTTP GET | Poll processing state |
+| `x-crypto-telegram-notifier` | EventBridge (event-driven) | Fire high-signal Telegram alerts |
+| `x-crypto-http-authorizer` | API Gateway authorizer | Validate all inbound requests |
 
 ---
 
@@ -205,15 +279,15 @@ The ingestion + normalization + OCR pipeline transforms this raw firehose into:
 ## Suggested Repo Layout
 
 ```
-exchanges/twitter/
-├─ lambdas/
-│  ├─ x-crypto-tweets-to-s3
-│  ├─ x-crypto-normalize-posts
-│  └─ x-crypto-image-text
-└─ docs/
-   ├─ x_ingestion_overview.md
-   ├─ x_normalization_overview.md
-   └─ x_ocr_overview.md
+lambdas/x/
+├─ x-crypto-tweets-to-s3/
+├─ x-crypto-normalize-posts/
+├─ x-crypto-image-text-builder/
+├─ x-crypto-posts-submit/
+├─ x-crypto-posts-worker/
+├─ x-crypto-posts-status/
+├─ x-crypto-telegram-notifier/
+└─ x-crypto-http-authorizer/
 ```
 
 ---
@@ -224,7 +298,12 @@ exchanges/twitter/
 ### Twitter (X) Pipeline
 - x-crypto-tweets-to-s3: 15‑min sharded ingress → bronze
 - x-crypto-normalize-posts: hourly normalization → silver.posts
-- x-crypto-image-text: hourly OCR → silver.image_text + silver.rag_docs
+- x-crypto-image-text-builder: hourly OCR → silver.image_text + silver.rag_docs
+- x-crypto-posts-submit: HTTP entry point for post submission
+- x-crypto-posts-worker: async worker for post processing jobs
+- x-crypto-posts-status: processing state tracker for submitted posts
+- x-crypto-telegram-notifier: event-driven Telegram alerts for high-signal events
+- x-crypto-http-authorizer: Lambda authorizer securing all API Gateway endpoints
 - Cost‑bounded, quota‑aware, serverless architecture powering real-time crypto RAG and alpha analytics.
 ```
 
@@ -238,10 +317,12 @@ This system provides a **complete crypto Twitter intelligence pipeline**:
 - **Normalizes** structured tweet data  
 - **Extracts** OCR text from images  
 - **Prepares** RAG‑ready documents in near real-time  
+- **Processes** post submissions asynchronously with full status tracking  
+- **Alerts** on high-signal events via Telegram  
+- **Secures** all API endpoints via a dedicated authorizer  
 
 All while maintaining:
 - Zero maintenance  
 - Predictable monthly cost  
 - High signal-to-noise  
 - Production stability  
-
