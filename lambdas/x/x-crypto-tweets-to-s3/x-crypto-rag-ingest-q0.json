@@ -1,0 +1,24 @@
+{
+    "ActionAfterCompletion": "NONE",
+    "Arn": "arn:aws:scheduler:us-east-1:454851577001:schedule/default/x-crypto-rag-ingest-q0",
+    "CreationDate": "2025-12-10T15:43:16.614000-06:00",
+    "Description": "Fetch recent tweets and media from X (Twitter) crypto handles – shard 1 of 4 (hourly ingestion, quota-aware).",
+    "FlexibleTimeWindow": {
+        "Mode": "OFF"
+    },
+    "GroupName": "default",
+    "LastModificationDate": "2026-03-04T14:39:31.586000-06:00",
+    "Name": "x-crypto-rag-ingest-q0",
+    "ScheduleExpression": "cron(0 * * * ? *)",
+    "ScheduleExpressionTimezone": "America/Mexico_City",
+    "State": "DISABLED",
+    "Target": {
+        "Arn": "arn:aws:lambda:us-east-1:454851577001:function:x-crypto-tweets-to-s3",
+        "Input": "{\"shard_index\": 0, \n\"shard_count\": 4}",
+        "RetryPolicy": {
+            "MaximumEventAgeInSeconds": 86400,
+            "MaximumRetryAttempts": 0
+        },
+        "RoleArn": "arn:aws:iam::454851577001:role/service-role/Amazon_EventBridge_Scheduler_Lambda_X_Crypto"
+    }
+}
