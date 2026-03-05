@@ -1,0 +1,2 @@
+arn:aws:lambda:us-east-1:454851577001:layer:python-requests-layer:1  (size: 1102972 bytes)
+arn:aws:lambda:us-east-1:454851577001:layer:daily-merge-pandas-layer:3  (size: 52101466 bytes)
