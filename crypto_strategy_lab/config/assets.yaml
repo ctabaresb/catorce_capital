@@ -1,0 +1,81 @@
+# ============================================================
+# Crypto Strategy Lab — Asset & Feature Configuration
+# ============================================================
+
+exchange:
+  name: bitso
+  bucket: bitso-orderbook
+  bbo_prefix: bitso_parquet/bitso_orderbook_merged.parquet
+  dom_prefix: bitso_dom_parquet/bitso_orderbook_merged.parquet
+
+# ============================================================
+# Assets
+# Each asset defines its base book, cross books, and whether
+# it has DOM data available (some assets BBO-only).
+# ============================================================
+
+assets:
+
+  btc_usd:
+    base_book: btc_usd
+    cross_books:
+      - eth_usd
+      - sol_usd
+    has_dom: true
+
+  eth_usd:
+    base_book: eth_usd
+    cross_books:
+      - btc_usd
+      - sol_usd
+    has_dom: true
+
+  sol_usd:
+    base_book: sol_usd
+    cross_books:
+      - btc_usd
+      - eth_usd
+    has_dom: true
+
+# ============================================================
+# Feature build parameters
+# ============================================================
+
+feature_build:
+  dom:
+    k: 10          # top-k levels for full depth features
+    k_small: 3     # top-k levels for near-touch features
+
+  windows_days:
+    - 180          # primary validation window
+    - 60           # sanity check only — not used for strategy decisions
+
+  decision_bars:
+    - timeframe: 15m
+      bar_minutes: 15
+      forward_horizons:
+        - label: H60m
+          bars: 4        # 4 × 15m = 60m
+        - label: H120m
+          bars: 8
+        - label: H240m
+          bars: 16
+
+    - timeframe: 30m
+      bar_minutes: 30
+      forward_horizons:
+        - label: H60m
+          bars: 2        # 2 × 30m = 60m
+        - label: H120m
+          bars: 4
+        - label: H240m
+          bars: 8
+
+# ============================================================
+# Output
+# ============================================================
+
+output:
+  dir: artifacts_features
+
+  # Naming convention: features_decision_{timeframe}_{base_book}_{days}d.parquet

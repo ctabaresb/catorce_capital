@@ -45,6 +45,11 @@ __pycache__/
 **/models/
 **/artifacts/
 
+# --- local artifacts / large data ---
+crypto_strategy_lab/data/artifacts_features/
+crypto_strategy_lab/scanner/
+*.parquet
+*.csv
 
 # Images
 **/images/
