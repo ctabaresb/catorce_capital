@@ -1,6 +1,7 @@
 {
-    "Backup and Deprecate": 60,
+    "Open Interest and Funding Rate": 60,
     "Break": 10,
-    "Data Sources": 90,
-    "Zoom Recording": 60
+    "Coin Gecko": 90,
+    "Coin Market Cap": 90,
+    "Crypto Lab": 60
 }

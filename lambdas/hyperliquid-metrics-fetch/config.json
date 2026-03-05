@@ -1,0 +1,56 @@
+{
+    "FunctionName": "hyperliquid-metrics-fetch",
+    "FunctionArn": "arn:aws:lambda:us-east-1:454851577001:function:hyperliquid-metrics-fetch",
+    "Runtime": "python3.13",
+    "Role": "arn:aws:iam::454851577001:role/lambda-s3-bitso-writer",
+    "Handler": "lambda_function.lambda_handler",
+    "CodeSize": 3963,
+    "Description": "",
+    "Timeout": 60,
+    "MemorySize": 128,
+    "LastModified": "2026-03-05T21:32:10.000+0000",
+    "CodeSha256": "m1Xkn7V11cxxjf9HEeYTX7Mh3TBgo/4U+Psc873D7+I=",
+    "Version": "$LATEST",
+    "Environment": {
+        "Variables": {
+            "S3_BUCKET": "hyperliquid-orderbook",
+            "MAX_RETRIES": "2",
+            "RETRY_BACKOFF_MS": "150",
+            "JSON_PREFIX": "hyperliquid_metrics_snapshots/",
+            "WRITE_GZIP": "true",
+            "COINS": "BTC,ETH,SOL",
+            "HTTP_TIMEOUT_SEC": "5.0",
+            "PARTITIONED_KEYS": "true"
+        }
+    },
+    "TracingConfig": {
+        "Mode": "PassThrough"
+    },
+    "RevisionId": "0064bd27-9fe5-46a9-a277-4d06e23df3fe",
+    "Layers": [
+        {
+            "Arn": "arn:aws:lambda:us-east-1:454851577001:layer:python-requests-layer:1",
+            "CodeSize": 1102972
+        }
+    ],
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
+    "PackageType": "Zip",
+    "Architectures": [
+        "x86_64"
+    ],
+    "EphemeralStorage": {
+        "Size": 512
+    },
+    "SnapStart": {
+        "ApplyOn": "None",
+        "OptimizationStatus": "Off"
+    },
+    "RuntimeVersionConfig": {
+        "RuntimeVersionArn": "arn:aws:lambda:us-east-1::runtime:b0f2d40716005f99e1e65ab9c4ba4749be69e8c44df93eecbb62a1fff12bd80f"
+    },
+    "LoggingConfig": {
+        "LogFormat": "Text",
+        "LogGroup": "/aws/lambda/hyperliquid-metrics-fetch"
+    }
+}
