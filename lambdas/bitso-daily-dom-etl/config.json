@@ -1,0 +1,54 @@
+{
+    "FunctionName": "bitso-daily-dom-etl",
+    "FunctionArn": "arn:aws:lambda:us-east-1:454851577001:function:bitso-daily-dom-etl",
+    "Runtime": "python3.12",
+    "Role": "arn:aws:iam::454851577001:role/lambda-s3-bitso-writer",
+    "Handler": "lambda_function.lambda_handler",
+    "CodeSize": 9331,
+    "Description": "",
+    "Timeout": 300,
+    "MemorySize": 1024,
+    "LastModified": "2026-03-05T17:42:59.000+0000",
+    "CodeSha256": "X2nNua/b0lKa2SLjMLlIzLspS7S5rbgcBKU17L4OUcc=",
+    "Version": "$LATEST",
+    "Environment": {
+        "Variables": {
+            "S3_BUCKET": "bitso-orderbook",
+            "JSON_PREFIX": "bitso_dom_snapshots/",
+            "WATERMARK_KEY": "bitso_dom_parquet/watermark.json",
+            "PARQUET_PREFIX": "bitso_dom_parquet/",
+            "CHUNK_SIZE": "20",
+            "RETENTION_DAYS": "3"
+        }
+    },
+    "TracingConfig": {
+        "Mode": "PassThrough"
+    },
+    "RevisionId": "2e2db4ee-40d0-4573-b18e-ccb7eb2638c0",
+    "Layers": [
+        {
+            "Arn": "arn:aws:lambda:us-east-1:454851577001:layer:data_layer:2",
+            "CodeSize": 29640751
+        }
+    ],
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
+    "PackageType": "Zip",
+    "Architectures": [
+        "x86_64"
+    ],
+    "EphemeralStorage": {
+        "Size": 512
+    },
+    "SnapStart": {
+        "ApplyOn": "None",
+        "OptimizationStatus": "Off"
+    },
+    "RuntimeVersionConfig": {
+        "RuntimeVersionArn": "arn:aws:lambda:us-east-1::runtime:27990c3d0965bea97240f3380b8d623b692705303bbde4c31fb02fa7daa05453"
+    },
+    "LoggingConfig": {
+        "LogFormat": "Text",
+        "LogGroup": "/aws/lambda/bitso-daily-dom-etl"
+    }
+}
