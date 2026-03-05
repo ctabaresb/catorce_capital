@@ -1,0 +1,97 @@
+# =============================================================================
+# strategies.yaml
+#
+# Controls which strategy to test, with which params, across which
+# asset/timeframe/window combinations.
+#
+# To test a different strategy: change `active_strategy` to one of the
+# keys listed under `strategies:`.
+#
+# To test a different scope: change `run_on` (or set to "all").
+# =============================================================================
+
+# ---- Which strategy to test right now ----
+active_strategy: spread_compression
+
+# ---- Which asset/timeframe/window combos to run ----
+# "all" = every combination defined in assets.yaml
+# or list specific combos explicitly
+run_on:
+  - asset: btc_usd
+    timeframe: 15m
+    window: 180
+  - asset: btc_usd
+    timeframe: 15m
+    window: 60
+  - asset: btc_usd
+    timeframe: 30m
+    window: 180
+  - asset: btc_usd
+    timeframe: 30m
+    window: 60
+
+# ---- Evaluation settings ----
+evaluation:
+  primary_horizon: H120m        # primary kill/pass horizon
+  all_horizons: [H60m, H120m, H240m]
+
+# ---- Strategy definitions ----
+# Each strategy has a `module` (import path) and `class` (class name),
+# plus a `params` block. Params here override strategy DEFAULT_PARAMS.
+#
+# Add a new strategy by adding a new key under `strategies:`.
+# =============================================================================
+
+strategies:
+
+  microprice_imbalance_pressure:
+    module: strategies.microprice_imbalance_pressure
+    class:  MicropriceImbalancePressure
+    params:
+      top_pct:          0.20
+      mpd_weight:       1.0
+      wimb_weight:      1.0
+      wimb_scale_bps:   10.0
+      eps:              1.0e-12
+      mpd_min_bps:      0.0       # set >0 to strengthen trigger (e.g. 0.5)
+      wimb_min:         0.0       # set >0 to strengthen trigger (e.g. 0.06)
+      agree:            false     # require sign(mpd)==sign(wimb)
+      spread_max_bps:   null      # null = no spread cap
+      min_slope_bps:    0.0
+
+  ichimoku_cloud_breakout:
+    module: strategies.ichimoku_cloud_breakout
+    class:  IchimokuCloudBreakout
+    params:
+      min_cloud_thick_bps:  3.0   # cloud thickness threshold (ratio, not bps)
+      min_slope_bps:        0.0     # ema_120m slope minimum
+      top_pct:              0.30
+      breakout_mean_threshold: 0.8
+
+  volatility_reversion:
+      module: strategies.volatility_reversion
+      class:  VolatilityReversion
+      params:
+        rv_ratio_min:      1.3    # rv_30m / rv_120m spike threshold
+        min_bar_ret_bps:  -5.0   # bar return floor — exclude deep drops
+        vov_ratio_max:     2.5   # vol-of-vol shock ceiling
+        top_pct:           0.30
+        min_slope_bps:     0.0
+
+  spread_compression:
+      module: strategies.spread_compression
+      class:  SpreadCompression
+      params:
+        spread_pct_threshold:  0.60
+        spread_max_abs_bps:    6.0
+        min_tradability:       50.0
+        top_pct:               0.30
+        min_slope_bps:         0.0
+
+  cross_asset_divergence:
+    module: strategies.cross_asset_divergence
+    class:  CrossAssetDivergence
+    params:
+      min_divergence_bps:   20.0  # abs(base_ret - cross_ret) threshold
+      top_pct:              0.25
+      min_slope_bps:        0.0
