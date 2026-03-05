@@ -1,0 +1,60 @@
+{
+    "FunctionName": "hyperliquid-dom-orderbook-fetch",
+    "FunctionArn": "arn:aws:lambda:us-east-1:454851577001:function:hyperliquid-dom-orderbook-fetch",
+    "Runtime": "python3.13",
+    "Role": "arn:aws:iam::454851577001:role/lambda-s3-bitso-writer",
+    "Handler": "lambda_function.lambda_handler",
+    "CodeSize": 4812,
+    "Description": "",
+    "Timeout": 60,
+    "MemorySize": 128,
+    "LastModified": "2026-03-05T04:07:10.000+0000",
+    "CodeSha256": "7XKc1xz1dZ9L2dM5kAe61poQJY3YLwhwX+/q2Om13qU=",
+    "Version": "$LATEST",
+    "Environment": {
+        "Variables": {
+            "S3_BUCKET": "hyperliquid-orderbook",
+            "DDB_TABLE": "bitso_snapshot_state",
+            "DDB_STRICT": "false",
+            "RETRY_BACKOFF_MS": "150",
+            "JSON_PREFIX": "hyperliquid_dom_snapshots/",
+            "WRITE_GZIP": "true",
+            "COINS": "BTC,ETH,SOL",
+            "DDB_BOOKS_ALLOWLIST": "BTC,ETH,SOL",
+            "DDB_STREAM": "dom",
+            "ORDERBOOK_PCT": "0.05",
+            "HTTP_TIMEOUT_SEC": "2.0",
+            "PARTITIONED_KEYS": "true"
+        }
+    },
+    "TracingConfig": {
+        "Mode": "PassThrough"
+    },
+    "RevisionId": "44aff465-a154-4986-ba8d-11c88eb698f5",
+    "Layers": [
+        {
+            "Arn": "arn:aws:lambda:us-east-1:454851577001:layer:python-requests-layer:1",
+            "CodeSize": 1102972
+        }
+    ],
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
+    "PackageType": "Zip",
+    "Architectures": [
+        "x86_64"
+    ],
+    "EphemeralStorage": {
+        "Size": 512
+    },
+    "SnapStart": {
+        "ApplyOn": "None",
+        "OptimizationStatus": "Off"
+    },
+    "RuntimeVersionConfig": {
+        "RuntimeVersionArn": "arn:aws:lambda:us-east-1::runtime:b0f2d40716005f99e1e65ab9c4ba4749be69e8c44df93eecbb62a1fff12bd80f"
+    },
+    "LoggingConfig": {
+        "LogFormat": "Text",
+        "LogGroup": "/aws/lambda/hyperliquid-dom-orderbook-fetch"
+    }
+}
