@@ -28,8 +28,6 @@ def evaluate(
     all_horizons: list = None,
     label: str = "",
 ) -> dict:
-    if all_horizons is None:
-        all_horizons = HORIZONS
     """
     Evaluate a boolean signal Series against a feature DataFrame.
 
@@ -45,6 +43,8 @@ def evaluate(
     -------
     dict with all metrics, kill flag, and kill reason
     """
+    if all_horizons is None:
+        all_horizons = HORIZONS
 
     avg_spread = SPREAD_BPS.get(asset, SPREAD_BPS["default"])
     horizon_col = f"fwd_ret_{primary_horizon}_bps"
@@ -90,14 +90,18 @@ def evaluate(
         result["kill_reason"] = f"n={n} < {KILL_CRITERIA['min_trades']} after dropna"
         return result
 
-    # Use realized spread at entry bar when available, else constant
+    # Use realized spread at entry bar when available, else constant.
+    # Round-trip cost = full spread:
+    #   entry at ask  = mid + half_spread  (cost: +half)
+    #   exit  at bid  = mid - half_spread  (cost: +half)
+    # Forward returns are computed mid-to-mid, so total deduction = full spread.
     spread_col = "spread_bps_bbo_p50"
     if spread_col in trades.columns:
         cost = pd.to_numeric(
             trades.loc[gross.index, spread_col], errors="coerce"
-        ).fillna(avg_spread) / 2.0   # one-way: half spread on entry
+        ).fillna(avg_spread)          # full round-trip spread
     else:
-        cost = pd.Series(avg_spread / 2.0, index=gross.index)
+        cost = pd.Series(avg_spread, index=gross.index)
 
     net = gross - cost
 
@@ -106,7 +110,9 @@ def evaluate(
     net_median  = float(net.median())
     gross_spread_ratio = gross_mean / avg_spread if avg_spread > 0 else np.nan
 
-    # --- Temporal stability: 3 equal trade-count segments
+    # --- Temporal stability: 3 equal trade-count segments (chronological order).
+    # Trailing trades (n % 3, max 2) are intentionally excluded to keep segment
+    # sizes exactly equal. At minimum n=30: seg_size=10, 0 trades dropped.
     seg_size = n // 3
     segs = [net.iloc[i * seg_size:(i + 1) * seg_size] for i in range(3)]
     seg_means = [float(s.mean()) if len(s) else np.nan for s in segs]
@@ -154,8 +160,10 @@ def evaluate(
         )
         return result
 
-    # --- Spread stress test: add 1× additional spread cost
-    net_stressed = net - (avg_spread / 2.0)
+    # --- Spread stress test: add 0.5× avg spread on top of already-charged full spread.
+    # Total deduction under stress = 1.5× avg_spread.
+    # Intent: verify edge survives moderately wider-than-average execution.
+    net_stressed = net - (avg_spread * 0.5)
     if float(net_stressed.mean()) <= 0:
         result["kill_reason"] = "fails 1× spread stress test"
         return result

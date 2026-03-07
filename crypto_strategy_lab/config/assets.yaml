@@ -1,56 +1,70 @@
 # ============================================================
-# Crypto Strategy Lab — Asset & Feature Configuration
+# Crypto Strategy Lab — Asset & Exchange Configuration
 # ============================================================
-
-exchange:
-  name: bitso
-  bucket: bitso-orderbook
-  bbo_prefix: bitso_parquet/bitso_orderbook_merged.parquet
-  dom_prefix: bitso_dom_parquet/bitso_orderbook_merged.parquet
-
+#
+# Structure:
+#   exchanges:
+#     {exchange_name}:
+#       bucket:     S3 bucket name
+#       dom_prefix: path prefix inside the bucket
+#                   Layout: {dom_prefix}dt=YYYY-MM-DD/data.parquet
+#       assets:
+#         {book_name}:
+#           cross_books: other books on the SAME exchange used for
+#                        cross-asset return features
+#           has_dom: whether full L2 DOM is available (vs BBO-only)
+#
+# BBO is always derived from DOM levels (max bid / min ask per snapshot).
+# No separate BBO prefix is needed.
 # ============================================================
-# Assets
-# Each asset defines its base book, cross books, and whether
-# it has DOM data available (some assets BBO-only).
+exchanges:
+  bitso:
+    bucket: bitso-orderbook
+    dom_prefix: bitso_dom_parquet/
+    assets:
+      btc_usd:
+        cross_books: [eth_usd, sol_usd]
+        has_dom: true
+      eth_usd:
+        cross_books: [btc_usd, sol_usd]
+        has_dom: true
+      sol_usd:
+        cross_books: [btc_usd, eth_usd]
+        has_dom: true
+  hyperliquid:
+    bucket: hyperliquid-orderbook
+    dom_prefix: hyperliquid_dom_parquet/
+    book_map:
+      btc_usd: BTC
+      eth_usd: ETH
+      sol_usd: SOL
+    assets:
+      btc_usd:
+        cross_books: [eth_usd]
+        has_dom: true
+      eth_usd:
+        cross_books: [btc_usd]
+        has_dom: true
 # ============================================================
-
-assets:
-
-  btc_usd:
-    base_book: btc_usd
-    cross_books:
-      - eth_usd
-      - sol_usd
-    has_dom: true
-
-  eth_usd:
-    base_book: eth_usd
-    cross_books:
-      - btc_usd
-      - sol_usd
-    has_dom: true
-
-  sol_usd:
-    base_book: sol_usd
-    cross_books:
-      - btc_usd
-      - eth_usd
-    has_dom: true
-
+# Feature build parameters (shared across exchanges)
 # ============================================================
-# Feature build parameters
-# ============================================================
-
 feature_build:
   dom:
     k: 10          # top-k levels for full depth features
     k_small: 3     # top-k levels for near-touch features
-
   windows_days:
     - 180          # primary validation window
-    - 60           # sanity check only — not used for strategy decisions
-
+    - 60           # recency check
   decision_bars:
+    - timeframe: 5m
+      bar_minutes: 5
+      forward_horizons:
+        - label: H60m
+          bars: 12       # 12 × 5m = 60m
+        - label: H120m
+          bars: 24
+        - label: H240m
+          bars: 48
     - timeframe: 15m
       bar_minutes: 15
       forward_horizons:
@@ -60,7 +74,6 @@ feature_build:
           bars: 8
         - label: H240m
           bars: 16
-
     - timeframe: 30m
       bar_minutes: 30
       forward_horizons:
@@ -70,12 +83,12 @@ feature_build:
           bars: 4
         - label: H240m
           bars: 8
-
 # ============================================================
-# Output
+# Output directories
 # ============================================================
-
 output:
-  dir: artifacts_features
-
-  # Naming convention: features_decision_{timeframe}_{base_book}_{days}d.parquet
+  raw_dir:      data/artifacts_raw       # download_raw.py writes here
+  features_dir: data/artifacts_features  # build_features.py writes here
+  # Raw naming:      {exchange}_{asset}_{days}d_raw.parquet
+  # Features naming: features_decision_{timeframe}_{exchange}_{asset}_{days}d.parquet
+  # Minute naming:   features_minute_{exchange}_{asset}_{days}d.parquet

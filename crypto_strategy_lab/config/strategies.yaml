@@ -63,7 +63,7 @@ strategies:
     module: strategies.ichimoku_cloud_breakout
     class:  IchimokuCloudBreakout
     params:
-      min_cloud_thick_bps:  3.0   # cloud thickness threshold (ratio, not bps)
+      min_cloud_thick_bps:  3.0   # minimum cloud thickness in bps — (cloud_top - cloud_bot) / price * 1e4
       min_slope_bps:        0.0     # ema_120m slope minimum
       top_pct:              0.30
       breakout_mean_threshold: 0.8
@@ -88,10 +88,56 @@ strategies:
         top_pct:               0.30
         min_slope_bps:         0.0
 
-  cross_asset_divergence:
-    module: strategies.cross_asset_divergence
-    class:  CrossAssetDivergence
+  # cross_asset_divergence: MODULE NOT YET IMPLEMENTED
+  # Uncomment when strategies/cross_asset_divergence.py is written.
+  # cross_asset_divergence:
+  #   module: strategies.cross_asset_divergence
+  #   class:  CrossAssetDivergence
+  #   params:
+  #     min_divergence_bps:   20.0
+  #     top_pct:              0.25
+  #     min_slope_bps:        0.0
+
+  # ── Discord analysis survivors ────────────────────────────────────────────
+
+  volume_breakout:
+    module: strategies.volume_breakout
+    class:  VolumeBreakout
     params:
-      min_divergence_bps:   20.0  # abs(base_ret - cross_ret) threshold
-      top_pct:              0.25
+      breakout_bars:        20      # new N-bar high definition (20 bars @ 15m = 5h high)
+      min_vol_zscore:       0.5     # DOM activity must be above 30-bar average
+      require_pocket_pivot: true    # enforce vol > max down-bar vol in prior 10 bars
+      require_adx:          true    # enforce ADX > 25 (strong trend gate)
+      spread_max_bps:       null    # no spread cap — let tradability_score handle it
+      top_pct:              0.30
       min_slope_bps:        0.0
+    # NOTE: vol_proxy_bar is DOM depth change, not true traded volume.
+    # pocket_pivot_flag is an approximation. Confidence: 40%.
+
+  twap_reversion:
+    module: strategies.twap_reversion
+    class:  TwapReversion
+    params:
+      twap_window:      "240m"    # 4h TWAP (use "720m" for 12h variant)
+      min_dev_zscore:   -1.5      # price must be 1.5+ std devs below TWAP
+      min_tradability:  40.0      # execution quality floor (mean reversion = wide spreads)
+      top_pct:          0.30
+      min_slope_bps:    0.0
+    # NOTE: TWAP deviation is correlated with dist_ema_120m.
+    # This likely shows a null result — included to test that explicitly.
+    # Confidence: 35%.
+
+  swing_failure_pattern:
+    module: strategies.swing_failure_pattern
+    class:  SwingFailurePattern
+    params:
+      min_wick_bps:     2.0     # minimum sweep wick below swing low (bps)
+      adx_max:          60.0    # reject if ADX > this (extreme trend)
+      require_adx:      true
+      min_tradability:  35.0    # sweep bars have wide spreads; keep floor low
+      top_pct:          0.30
+      min_slope_bps:    0.0
+    # NOTE: sfp_low_flag = bar swept below swing low AND closed above it.
+    # This is the long-only (bullish) SFP formulation.
+    # sfp_long_flag (high sweep) is a short signal — NOT used here.
+    # Confidence: 50%.
