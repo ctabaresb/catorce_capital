@@ -2,7 +2,9 @@
 import numpy as np
 import pandas as pd
 
-# Per-asset spread constants (bps) — update when ETH/SOL data is available
+# Per-asset spread constants (bps) — fallback when realized spread is unavailable
+# Bitso spot: wide spreads, zero taker fee
+# Hyperliquid perp: tight BBO spread, but taker fee adds 7 bps round-trip
 SPREAD_BPS = {
     "btc_usd": 4.75,
     "eth_usd": 5.00,
@@ -10,11 +12,26 @@ SPREAD_BPS = {
     "default": 5.00,
 }
 
+# Hyperliquid taker fee: 0.035% per side = 3.5 bps, round-trip = 7 bps.
+# Added on top of realized spread for any strategy with exchange="hyperliquid".
+# Minimum viable gross on HL ≈ spread (~1 bps) + 7 bps fees = ~8 bps total.
+# 2× cost rule → need ~16 bps gross for conviction (vs ~9.5 bps on Bitso).
+HL_TAKER_FEE_BPS = 7.0   # round-trip (entry + exit)
+
+# HL BBO spread fallback — actual realized spread from parquet is used when available.
+# These are only the default when spread_bps_bbo_p50 column is absent.
+HL_SPREAD_FALLBACK = {
+    "btc_usd": 1.0,
+    "eth_usd": 1.5,
+    "sol_usd": 2.0,
+    "default": 2.0,
+}
+
 KILL_CRITERIA = {
     "min_trades":              30,
     "min_net_mean":            0.0,
     "min_segments_positive":   2,
-    "min_gross_spread_ratio":  2.0,   # gross must be > 2× avg spread
+    "min_gross_spread_ratio":  2.0,   # gross must be > 2× total avg cost
 }
 
 HORIZONS = ["H60m", "H120m", "H240m"]
@@ -24,6 +41,8 @@ def evaluate(
     df: pd.DataFrame,
     signal: pd.Series,
     asset: str = "btc_usd",
+    exchange: str = "bitso",
+    direction: str = "long",
     primary_horizon: str = "H120m",
     all_horizons: list = None,
     label: str = "",
@@ -34,8 +53,12 @@ def evaluate(
     Parameters
     ----------
     df              : feature parquet DataFrame (one asset, one timeframe)
-    signal          : boolean Series, True = enter long, aligned to df.index
+    signal          : boolean Series, True = enter, aligned to df.index
     asset           : asset key for spread lookup
+    exchange        : "bitso" or "hyperliquid" — controls cost model
+    direction       : "long" (default) or "short"
+                      For short, forward returns are negated before cost deduction.
+                      A short entry profits when price falls.
     primary_horizon : which horizon drives kill/pass verdict
     label           : human-readable label for logging
 
@@ -46,15 +69,26 @@ def evaluate(
     if all_horizons is None:
         all_horizons = HORIZONS
 
-    avg_spread = SPREAD_BPS.get(asset, SPREAD_BPS["default"])
+    # Cost model: HL adds taker fee on top of realized spread
+    is_hl = (exchange == "hyperliquid")
+    if is_hl:
+        avg_spread = HL_SPREAD_FALLBACK.get(asset, HL_SPREAD_FALLBACK["default"])
+        avg_total_cost = avg_spread + HL_TAKER_FEE_BPS
+    else:
+        avg_spread = SPREAD_BPS.get(asset, SPREAD_BPS["default"])
+        avg_total_cost = avg_spread
+
     horizon_col = f"fwd_ret_{primary_horizon}_bps"
     valid_col   = f"fwd_valid_{primary_horizon}"
 
     result = {
         "label":           label,
         "asset":           asset,
+        "exchange":        exchange,
+        "direction":       direction,
         "primary_horizon": primary_horizon,
         "avg_spread_bps":  avg_spread,
+        "avg_total_cost":  avg_total_cost,
         "kill":            True,
         "kill_reason":     None,
     }
@@ -90,25 +124,35 @@ def evaluate(
         result["kill_reason"] = f"n={n} < {KILL_CRITERIA['min_trades']} after dropna"
         return result
 
-    # Use realized spread at entry bar when available, else constant.
-    # Round-trip cost = full spread:
-    #   entry at ask  = mid + half_spread  (cost: +half)
-    #   exit  at bid  = mid - half_spread  (cost: +half)
-    # Forward returns are computed mid-to-mid, so total deduction = full spread.
+    # Direction: short strategies profit when price falls → negate forward returns.
+    # Cost deduction is direction-neutral (always subtracted regardless of side).
+    if direction == "short":
+        gross = -gross
+
+    # Cost model:
+    #   Bitso:        cost = full round-trip spread (zero taker)
+    #   Hyperliquid:  cost = realized spread + HL_TAKER_FEE_BPS (7 bps round-trip)
+    # Use realized spread at entry bar when available, else asset constant.
     spread_col = "spread_bps_bbo_p50"
     if spread_col in trades.columns:
-        cost = pd.to_numeric(
+        realized_spread = pd.to_numeric(
             trades.loc[gross.index, spread_col], errors="coerce"
-        ).fillna(avg_spread)          # full round-trip spread
+        ).fillna(avg_spread)
     else:
-        cost = pd.Series(avg_spread, index=gross.index)
+        realized_spread = pd.Series(avg_spread, index=gross.index)
+
+    if is_hl:
+        cost = realized_spread + HL_TAKER_FEE_BPS
+    else:
+        cost = realized_spread   # full round-trip spread; zero taker on Bitso
 
     net = gross - cost
 
     gross_mean  = float(gross.mean())
     net_mean    = float(net.mean())
     net_median  = float(net.median())
-    gross_spread_ratio = gross_mean / avg_spread if avg_spread > 0 else np.nan
+    # Ratio vs total average cost (spread + fees) — consistent across exchanges
+    gross_spread_ratio = gross_mean / avg_total_cost if avg_total_cost > 0 else np.nan
 
     # --- Temporal stability: 3 equal trade-count segments (chronological order).
     # Trailing trades (n % 3, max 2) are intentionally excluded to keep segment
@@ -160,10 +204,10 @@ def evaluate(
         )
         return result
 
-    # --- Spread stress test: add 0.5× avg spread on top of already-charged full spread.
-    # Total deduction under stress = 1.5× avg_spread.
-    # Intent: verify edge survives moderately wider-than-average execution.
-    net_stressed = net - (avg_spread * 0.5)
+    # Spread stress test: add 0.5× avg total cost on top of already-charged cost.
+    # Total deduction under stress = 1.5× avg_total_cost.
+    # On HL this is 1.5 × (spread + 7 bps) — verifies edge survives wider fills.
+    net_stressed = net - (avg_total_cost * 0.5)
     if float(net_stressed.mean()) <= 0:
         result["kill_reason"] = "fails 1× spread stress test"
         return result
@@ -173,9 +217,11 @@ def evaluate(
 
 
 def print_result(r: dict) -> None:
-    status = "PASS ✅" if not r["kill"] else f"KILL ❌  ({r['kill_reason']})"
+    status   = "PASS ✅" if not r["kill"] else f"KILL ❌  ({r['kill_reason']})"
+    dir_tag  = "↓ SHORT" if r.get("direction") == "short" else "↑ LONG"
+    exc_tag  = r.get("exchange", "bitso")
     print(
-        f"{status:45s} | {r.get('label', '')} | "
+        f"{status:45s} | {r.get('label', '')} | {dir_tag} | "
         f"n={r.get('n_trades', 0):5d} | "
         f"gross={r.get('gross_mean_bps', float('nan')):7.3f} bps | "
         f"net={r.get('net_mean_bps', float('nan')):7.3f} bps | "

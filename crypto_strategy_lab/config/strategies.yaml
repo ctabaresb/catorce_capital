@@ -35,7 +35,8 @@ evaluation:
   primary_horizon: H120m        # primary kill/pass horizon
   all_horizons: [H60m, H120m, H240m]
 
-# ---- Strategy definitions ----
+# =============================================================================
+# Strategy definitions
 # Each strategy has a `module` (import path) and `class` (class name),
 # plus a `params` block. Params here override strategy DEFAULT_PARAMS.
 #
@@ -44,100 +45,226 @@ evaluation:
 
 strategies:
 
+  # ── Bitso strategies (long-only spot, zero fees) ───────────────────────────
+  # All tested on BTC/USD 180d window. All killed or parked.
+  # Status as of March 2026: BTC fell 38.5% over test window.
+  # Unconditional fwd return H120m = -2.05 bps — hostile for long-only.
+
   microprice_imbalance_pressure:
     module: strategies.microprice_imbalance_pressure
     class:  MicropriceImbalancePressure
+    # STATUS: DEAD — gross -2.2 bps at 15m/180d. Anti-predictive long.
     params:
       top_pct:          0.20
       mpd_weight:       1.0
       wimb_weight:      1.0
       wimb_scale_bps:   10.0
       eps:              1.0e-12
-      mpd_min_bps:      0.0       # set >0 to strengthen trigger (e.g. 0.5)
-      wimb_min:         0.0       # set >0 to strengthen trigger (e.g. 0.06)
-      agree:            false     # require sign(mpd)==sign(wimb)
-      spread_max_bps:   null      # null = no spread cap
+      mpd_min_bps:      0.0
+      wimb_min:         0.0
+      agree:            false
+      spread_max_bps:   null
       min_slope_bps:    0.0
 
   ichimoku_cloud_breakout:
     module: strategies.ichimoku_cloud_breakout
     class:  IchimokuCloudBreakout
+    # STATUS: PARK — gross -0.036 bps at 15m/180d. Least wrong. Retest in bull market.
     params:
-      min_cloud_thick_bps:  3.0   # minimum cloud thickness in bps — (cloud_top - cloud_bot) / price * 1e4
-      min_slope_bps:        0.0     # ema_120m slope minimum
-      top_pct:              0.30
+      min_cloud_thick_bps:     3.0
+      min_slope_bps:           0.0
+      top_pct:                 0.30
       breakout_mean_threshold: 0.8
 
   volatility_reversion:
-      module: strategies.volatility_reversion
-      class:  VolatilityReversion
-      params:
-        rv_ratio_min:      1.3    # rv_30m / rv_120m spike threshold
-        min_bar_ret_bps:  -5.0   # bar return floor — exclude deep drops
-        vov_ratio_max:     2.5   # vol-of-vol shock ceiling
-        top_pct:           0.30
-        min_slope_bps:     0.0
+    module: strategies.volatility_reversion
+    class:  VolatilityReversion
+    # STATUS: PARK — n=11 at 15m/180d. Signal starvation in bear market.
+    params:
+      rv_ratio_min:     1.3
+      min_bar_ret_bps: -5.0
+      vov_ratio_max:    2.5
+      top_pct:          0.30
+      min_slope_bps:    0.0
 
   spread_compression:
-      module: strategies.spread_compression
-      class:  SpreadCompression
-      params:
-        spread_pct_threshold:  0.60
-        spread_max_abs_bps:    6.0
-        min_tradability:       50.0
-        top_pct:               0.30
-        min_slope_bps:         0.0
+    module: strategies.spread_compression
+    class:  SpreadCompression
+    # STATUS: DEAD — gross -6.4 bps at 15m/180d. No directional component.
+    params:
+      spread_pct_threshold: 0.60
+      spread_max_abs_bps:   6.0
+      min_tradability:      50.0
+      top_pct:              0.30
+      min_slope_bps:        0.0
 
   # cross_asset_divergence: MODULE NOT YET IMPLEMENTED
-  # Uncomment when strategies/cross_asset_divergence.py is written.
   # cross_asset_divergence:
   #   module: strategies.cross_asset_divergence
   #   class:  CrossAssetDivergence
   #   params:
-  #     min_divergence_bps:   20.0
-  #     top_pct:              0.25
-  #     min_slope_bps:        0.0
-
-  # ── Discord analysis survivors ────────────────────────────────────────────
+  #     min_divergence_bps: 20.0
+  #     top_pct:            0.25
+  #     min_slope_bps:      0.0
 
   volume_breakout:
     module: strategies.volume_breakout
     class:  VolumeBreakout
+    # STATUS: PARK — gross -1.1 bps, n=72. Needs real volume data or bull market.
+    # NOTE: vol_proxy_bar is DOM depth change, not true traded volume.
     params:
-      breakout_bars:        20      # new N-bar high definition (20 bars @ 15m = 5h high)
-      min_vol_zscore:       0.5     # DOM activity must be above 30-bar average
-      require_pocket_pivot: true    # enforce vol > max down-bar vol in prior 10 bars
-      require_adx:          true    # enforce ADX > 25 (strong trend gate)
-      spread_max_bps:       null    # no spread cap — let tradability_score handle it
+      breakout_bars:        20
+      min_vol_zscore:       0.5
+      require_pocket_pivot: true
+      require_adx:          true
+      spread_max_bps:       null
       top_pct:              0.30
       min_slope_bps:        0.0
-    # NOTE: vol_proxy_bar is DOM depth change, not true traded volume.
-    # pocket_pivot_flag is an approximation. Confidence: 40%.
 
   twap_reversion:
     module: strategies.twap_reversion
     class:  TwapReversion
-    params:
-      twap_window:      "240m"    # 4h TWAP (use "720m" for 12h variant)
-      min_dev_zscore:   -1.5      # price must be 1.5+ std devs below TWAP
-      min_tradability:  40.0      # execution quality floor (mean reversion = wide spreads)
-      top_pct:          0.30
-      min_slope_bps:    0.0
+    # STATUS: PARK — gate redesign needed. Anti-crash filter conflict with bear market.
     # NOTE: TWAP deviation is correlated with dist_ema_120m.
-    # This likely shows a null result — included to test that explicitly.
-    # Confidence: 35%.
+    params:
+      twap_window:          "240m"
+      min_dev_zscore:       -1.5
+      min_tradability:      40.0
+      top_pct:              0.30
+      min_slope_bps:        -5.0
+      max_dist_below_ema:   -0.03
+      max_vov_ratio:        3.0
 
   swing_failure_pattern:
     module: strategies.swing_failure_pattern
     class:  SwingFailurePattern
+    # STATUS: PARK — gate redesign needed. 884 raw signals, only 12 survive regime gate.
+    # NOTE: sfp_low_flag = bullish (low sweep). sfp_long_flag = bearish — NOT used.
     params:
-      min_wick_bps:     2.0     # minimum sweep wick below swing low (bps)
-      adx_max:          60.0    # reject if ADX > this (extreme trend)
-      require_adx:      true
-      min_tradability:  35.0    # sweep bars have wide spreads; keep floor low
-      top_pct:          0.30
-      min_slope_bps:    0.0
-    # NOTE: sfp_low_flag = bar swept below swing low AND closed above it.
-    # This is the long-only (bullish) SFP formulation.
-    # sfp_long_flag (high sweep) is a short signal — NOT used here.
-    # Confidence: 50%.
+      min_wick_bps:         2.0
+      adx_max:              60.0
+      require_adx:          true
+      min_tradability:      35.0
+      top_pct:              0.30
+      min_slope_bps:        -5.0
+      max_dist_below_ema:   -0.05
+      max_vov_ratio:        3.0
+
+  # ── Hyperliquid strategies (bidirectional perpetuals) ──────────────────────
+  # Requires: build_features_hl.py parquets
+  # Cost model: spread + 7 bps round-trip taker fee
+  # Minimum viable gross: ~16 bps (2× total cost)
+  # Test with: python test_strategy.py --exchange hyperliquid --strategy <name>
+
+  funding_rate_contrarian:
+    module:    strategies.funding_rate_contrarian
+    class:     FundingRateContrarian
+    direction: long
+    # STATUS: UNTESTED — awaiting HL parquets
+    # Hypothesis: extreme negative funding = overcrowded shorts = squeeze setup
+    # Carry mechanism: longs receive funding every 8h — reduces net cost of trade
+    # Confidence: 55%
+    params:
+      funding_zscore_thresh:   1.5
+      funding_abs_thresh:     -0.0003
+      oi_expansion_thresh:     2.0
+      min_slope_bps:          -5.0
+      max_dist_below_ema:     -0.05
+      max_vov_ratio:           3.0
+      min_tradability:         35.0
+      max_impact_spread_bps:   15.0
+      top_pct:                 0.35
+
+  funding_rate_contrarian_short:
+    module:    strategies.funding_rate_contrarian
+    class:     FundingRateContrarian_Short
+    direction: short
+    # STATUS: UNTESTED — awaiting HL parquets
+    # Hypothesis: extreme positive funding = overcrowded longs = reversal setup
+    # Confidence: 50%
+    params:
+      funding_zscore_thresh:   1.5
+      funding_abs_thresh:      0.0003
+      oi_expansion_thresh:     2.0
+      min_slope_bps:          -10.0
+      max_dist_above_ema:      0.05
+      max_vov_ratio:           3.0
+      min_tradability:         35.0
+      max_impact_spread_bps:   15.0
+      top_pct:                 0.35
+
+  oi_capitulation:
+    module:    strategies.oi_divergence
+    class:     OI_Capitulation
+    direction: long
+    # STATUS: UNTESTED — awaiting HL parquets
+    # Hypothesis: forced liquidation exhaustion → price rebounds
+    # Confidence: 40%
+    params:
+      min_oi_decline_4h_pct:  -1.0
+      max_ret_bps_bar:        -3.0
+      max_oi_decline_1h_pct:  -3.0
+      min_slope_bps:          -10.0
+      max_dist_below_ema:     -0.08
+      max_vov_ratio:           4.0
+      min_tradability:         30.0
+      max_impact_spread_bps:   20.0
+      top_pct:                 0.40
+
+  oi_distribution:
+    module:    strategies.oi_divergence
+    class:     OI_Distribution
+    direction: short
+    # STATUS: UNTESTED — awaiting HL parquets
+    # Hypothesis: short squeeze exhaustion → price fades
+    # Confidence: 40%
+    params:
+      min_oi_decline_4h_pct:  -0.5
+      min_ret_bps_bar:         3.0
+      max_funding_8h:          0.0002
+      max_slope_bps:           15.0
+      max_dist_above_ema:       0.05
+      max_vov_ratio:            3.0
+      min_tradability:          35.0
+      max_impact_spread_bps:   15.0
+      top_pct:                  0.35
+
+  mark_oracle_premium_long:
+    module:    strategies.mark_oracle_premium
+    class:     MarkOraclePremium_Long
+    direction: long
+    # STATUS: UNTESTED — awaiting HL parquets
+    # Hypothesis: mark deeply below oracle → arbitrage pressure pulls it back
+    # Confidence: 40%
+    params:
+      premium_zscore_thresh:    -1.5
+      premium_abs_thresh_bps:   -3.0
+      require_reverting:         true
+      require_funding_alignment: false
+      funding_alignment_thresh:  0.0
+      min_slope_bps:            -5.0
+      max_dist_below_ema:       -0.05
+      max_vov_ratio:             3.0
+      min_tradability:           35.0
+      max_impact_spread_bps:    15.0
+      top_pct:                   0.35
+
+  mark_oracle_premium_short:
+    module:    strategies.mark_oracle_premium
+    class:     MarkOraclePremium_Short
+    direction: short
+    # STATUS: UNTESTED — awaiting HL parquets
+    # Hypothesis: mark above oracle → arbitrage pressure compresses premium
+    # Confidence: 38%
+    params:
+      premium_zscore_thresh:    1.5
+      premium_abs_thresh_bps:   3.0
+      require_reverting:        true
+      require_funding_alignment: false
+      funding_alignment_thresh:  0.0
+      max_slope_bps:            20.0
+      max_dist_above_ema:        0.06
+      max_vov_ratio:             3.0
+      min_tradability:           35.0
+      max_impact_spread_bps:    15.0
+      top_pct:                   0.35
