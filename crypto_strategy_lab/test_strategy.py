@@ -209,6 +209,7 @@ def save_results(results: list, strategy_name: str, out_dir: str) -> str:
             "strategy":           strategy_name,
             "label":              r.get("label", ""),
             "exchange":           r.get("exchange", ""),
+            "direction":          r.get("direction", "long"),
             "asset":              r.get("asset", ""),
             "primary_horizon":    r.get("primary_horizon", ""),
             "kill":               r.get("kill", True),
@@ -303,9 +304,16 @@ def main():
         n_signals = int(signal.sum())
         print(f"    Signals: {n_signals:,} / {len(df):,} bars ({n_signals / len(df) * 100:.1f}%)")
 
+        # Pull direction and exchange from strategy class attributes if set.
+        # Falls back to "long" / "bitso" for all existing Bitso strategies.
+        strat_direction = getattr(strategy, "DIRECTION", "long")
+        strat_exchange  = getattr(strategy, "EXCHANGE",  exchange)   # CLI exchange wins
+
         r = evaluate(
             df, signal,
             asset=asset,
+            exchange=strat_exchange,
+            direction=strat_direction,
             primary_horizon=primary_horizon,
             all_horizons=all_horizons,
             label=label,

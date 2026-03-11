@@ -75,7 +75,7 @@ JSON_PREFIX    = _env_str("JSON_PREFIX",    "hyperliquid_metrics_snapshots").rst
 PARQUET_PREFIX = _env_str("PARQUET_PREFIX", "hyperliquid_metrics_parquet").rstrip("/")
 WATERMARK_KEY  = _env_str("WATERMARK_KEY",  PARQUET_PREFIX + "/watermark.json")
 CHUNK_SIZE     = _env_int("CHUNK_SIZE",     20)
-SAFETY_MILLIS  = _env_int("SAFETY_MILLIS",  60_000)
+SAFETY_MILLIS  = _env_int("SAFETY_MILLIS",  90_000)
 RETENTION_DAYS = _env_int("RETENTION_DAYS", 2)
 
 
@@ -232,7 +232,41 @@ def _ts_to_wm(ts_map: dict) -> dict:
 
 # ── S3 listing ─────────────────────────────────────────────────────────────────
 
-def _list_json_keys(base_prefix: str, since_date: Optional[datetime]) -> list:
+def _ts_from_key(key: str) -> Optional[pd.Timestamp]:
+    """
+    Parse the ISO timestamp embedded in the snapshot filename.
+
+    Key format:
+        {prefix}/dt=YYYY-MM-DD/hour=HH/{iso_timestamp}.json.gz
+
+    Returns a UTC Timestamp or None if parsing fails.
+    Used to pre-filter keys BEFORE issuing GETs -- avoids downloading
+    files that are already behind the watermark.
+    """
+    fname = key.split("/")[-1]
+    for ext in (".json.gz", ".json"):
+        if fname.endswith(ext):
+            fname = fname[: -len(ext)]
+            break
+    try:
+        return pd.to_datetime(fname, utc=True)
+    except Exception:
+        return None
+
+
+def _list_json_keys(
+    base_prefix: str,
+    since_date: Optional[datetime],
+    min_watermark_ts: Optional[pd.Timestamp] = None,
+) -> list:
+    """
+    List JSON snapshot keys under dt= partitions >= since_date.
+
+    min_watermark_ts: if provided, keys whose filename timestamp is
+    <= this value are skipped entirely -- no GET issued, no time wasted.
+    This eliminates the wasted GETs on already-processed files that
+    previously caused checkpoint timeouts.
+    """
     paginator = s3.get_paginator("list_objects_v2")
     base      = base_prefix.rstrip("/") + "/"
     keys      = []
@@ -246,12 +280,23 @@ def _list_json_keys(base_prefix: str, since_date: Optional[datetime]) -> list:
             if since_date is None or dt.date() >= since_date.date():
                 dt_prefixes.append(cp["Prefix"])
 
+    skipped = 0
     for dt_prefix in sorted(dt_prefixes):
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=dt_prefix):
             for obj in page.get("Contents", []):
                 k = obj["Key"]
-                if k.endswith(".json") or k.endswith(".json.gz"):
-                    keys.append(k)
+                if not (k.endswith(".json") or k.endswith(".json.gz")):
+                    continue
+                # Pre-filter: skip keys already behind the watermark
+                if min_watermark_ts is not None:
+                    file_ts = _ts_from_key(k)
+                    if file_ts is not None and file_ts <= min_watermark_ts:
+                        skipped += 1
+                        continue
+                keys.append(k)
+
+    if skipped:
+        print(f"Pre-filtered {skipped} already-processed keys (saved {skipped} GETs)")
 
     return sorted(keys)
 
@@ -379,7 +424,14 @@ def _run_etl(event: dict, context: Any) -> dict:
         min_wm     = min(last_ts.values())
         since_date = (min_wm - timedelta(days=1)).to_pydatetime()
 
-    all_keys = _list_json_keys(JSON_PREFIX, since_date)
+    # min_watermark_ts: the earliest watermark across all coins.
+    # _list_json_keys uses this to skip files by filename before issuing
+    # any GET -- eliminates the wasted GETs that caused the timeout.
+    min_watermark_ts: Optional[pd.Timestamp] = None
+    if last_ts:
+        min_watermark_ts = min(last_ts.values())
+
+    all_keys = _list_json_keys(JSON_PREFIX, since_date, min_watermark_ts)
 
     print(
         f"ETL start | keys={len(all_keys)} "

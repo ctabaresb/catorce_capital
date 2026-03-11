@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""
+unified_recorder.py
+Production-grade multi-asset lead-lag data recorder.
+Records Coinbase + BinanceUS + Bitso order book ticks for BTC, ETH, SOL.
+
+FILE NAMING CONVENTION (always):
+  {asset}_{exchange}_{YYYYMMDD}_{HHMMSS}.parquet
+  e.g.  btc_binance_20260308_173200.parquet
+        eth_coinbase_20260308_173200.parquet
+        sol_bitso_20260308_173200.parquet
+
+This replaces:
+  - lead_lag_recorder.py  (BTC only, no asset prefix — legacy)
+  - multi_asset_recorder.py (ETH+SOL, separate process)
+
+MIGRATION NOTE:
+  Legacy BTC files without asset prefix (binance_*.parquet, coinbase_*.parquet,
+  bitso_*.parquet) remain valid in S3. The research script handles both naming
+  conventions via the --legacy-btc flag.
+
+USAGE:
+  python3 unified_recorder.py                        # btc eth sol (default)
+  python3 unified_recorder.py --assets btc           # BTC only
+  python3 unified_recorder.py --assets btc eth sol   # all three
+
+ROTATION:
+  New parquet file every ROTATE_SEC seconds (default 3600 = 1 hour).
+  On shutdown (SIGINT/SIGTERM), all buffers flushed immediately.
+
+S3 SYNC:
+  Handled by existing cron: 0 * * * * aws s3 sync data/ s3://bitso-orderbook/data/
+  No changes needed to existing cron.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import json
+import os
+import signal
+import time
+from pathlib import Path
+from typing import Dict
+
+import pandas as pd
+import websockets
+
+# ------------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------------
+
+ROTATE_SEC = int(os.environ.get("ROTATE_SEC", "3600"))  # 1 hour default
+MAX_ROWS   = 500_000   # hard cap per buffer before forced flush
+DATA_DIR   = Path(os.environ.get("DATA_DIR", "data"))
+
+ASSET_CONFIG: Dict[str, Dict[str, str]] = {
+    "btc": {
+        "binance_stream":  "btcusdt@bookTicker",
+        "coinbase_product": "BTC-USD",
+        "bitso_book":       "btc_usd",
+    },
+    "eth": {
+        "binance_stream":   "ethusdt@bookTicker",
+        "coinbase_product": "ETH-USD",
+        "bitso_book":       "eth_usd",
+    },
+    "sol": {
+        "binance_stream":   "solusdt@bookTicker",
+        "coinbase_product": "SOL-USD",
+        "bitso_book":       "sol_usd",
+    },
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(Path("logs") / "unified_recorder.log"),
+    ],
+)
+log = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------
+# BUFFER
+# ------------------------------------------------------------------
+
+class TickBuffer:
+    """
+    Thread-safe in-memory buffer for one asset/exchange pair.
+    Flushes to parquet on rotation or max_rows.
+    Naming: {asset}_{exchange}_{YYYYMMDD}_{HHMMSS}.parquet
+    """
+
+    def __init__(self, asset: str, exchange: str):
+        self.asset    = asset
+        self.exchange = exchange
+        self._rows:   list  = []
+        self._start:  float = time.time()
+        self._ts_str: str   = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+    @property
+    def filename(self) -> Path:
+        return DATA_DIR / f"{self.asset}_{self.exchange}_{self._ts_str}.parquet"
+
+    def append(self, bid: float, ask: float) -> None:
+        self._rows.append({
+            "ts":  time.time(),
+            "bid": bid,
+            "ask": ask,
+            "mid": (bid + ask) / 2,
+        })
+        if len(self._rows) >= MAX_ROWS:
+            self.flush(reason="max_rows")
+
+    def should_rotate(self) -> bool:
+        return (time.time() - self._start) >= ROTATE_SEC
+
+    def flush(self, reason: str = "rotation") -> None:
+        if not self._rows:
+            return
+        path = self.filename
+        pd.DataFrame(self._rows).to_parquet(path, index=False)
+        log.info(
+            "FLUSH [%s/%s] %d rows -> %s (%s)",
+            self.exchange.upper(), self.asset.upper(),
+            len(self._rows), path.name, reason,
+        )
+        self._rows   = []
+        self._start  = time.time()
+        self._ts_str = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+    def size(self) -> int:
+        return len(self._rows)
+
+
+# ------------------------------------------------------------------
+# FEED COROUTINES
+# ------------------------------------------------------------------
+
+async def feed_binance(asset: str, buf: TickBuffer) -> None:
+    stream  = ASSET_CONFIG[asset]["binance_stream"]
+    url     = f"wss://stream.binance.us:9443/ws/{stream}"
+    backoff = 1.0
+    while True:
+        try:
+            async with websockets.connect(
+                url, ping_interval=20, ping_timeout=20,
+            ) as ws:
+                backoff = 1.0
+                log.info("[binance/%s] Connected.", asset)
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    b, a = float(msg.get("b", 0)), float(msg.get("a", 0))
+                    if b > 0 and a > 0 and b < a:
+                        buf.append(b, a)
+                    if buf.should_rotate():
+                        buf.flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("[binance/%s] %s - retry in %.0fs", asset, e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+
+async def feed_coinbase(asset: str, buf: TickBuffer) -> None:
+    product = ASSET_CONFIG[asset]["coinbase_product"]
+    url     = "wss://ws-feed.exchange.coinbase.com"
+    backoff = 1.0
+    while True:
+        try:
+            async with websockets.connect(
+                url, ping_interval=20, ping_timeout=20,
+            ) as ws:
+                await ws.send(json.dumps({
+                    "type":        "subscribe",
+                    "product_ids": [product],
+                    "channels":    ["ticker"],
+                }))
+                backoff = 1.0
+                log.info("[coinbase/%s] Connected.", asset)
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    if msg.get("type") != "ticker":
+                        continue
+                    b, a = msg.get("best_bid"), msg.get("best_ask")
+                    if b and a:
+                        buf.append(float(b), float(a))
+                    if buf.should_rotate():
+                        buf.flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("[coinbase/%s] %s - retry in %.0fs", asset, e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+
+async def feed_bitso(asset: str, buf: TickBuffer) -> None:
+    book    = ASSET_CONFIG[asset]["bitso_book"]
+    url     = "wss://ws.bitso.com"
+    backoff = 1.0
+    bids: dict = {}
+    asks: dict = {}
+
+    while True:
+        try:
+            async with websockets.connect(
+                url, ping_interval=20, ping_timeout=20, max_size=2**22,
+            ) as ws:
+                await ws.send(json.dumps({
+                    "action": "subscribe",
+                    "book":   book,
+                    "type":   "orders",
+                }))
+                backoff = 1.0
+                bids.clear()
+                asks.clear()
+                log.info("[bitso/%s] Connected.", asset)
+
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    if not isinstance(msg, dict) or msg.get("type") != "orders":
+                        continue
+                    payload = msg.get("payload", {})
+                    if not isinstance(payload, dict):
+                        continue
+                    for row in payload.get("bids", []):
+                        try:
+                            px, sz = float(row["r"]), float(row["a"])
+                            if sz == 0:
+                                bids.pop(px, None)
+                            else:
+                                bids[px] = sz
+                        except Exception:
+                            continue
+                    for row in payload.get("asks", []):
+                        try:
+                            px, sz = float(row["r"]), float(row["a"])
+                            if sz == 0:
+                                asks.pop(px, None)
+                            else:
+                                asks[px] = sz
+                        except Exception:
+                            continue
+                    if not bids or not asks:
+                        continue
+                    bb, ba = max(bids), min(asks)
+                    if bb >= ba:
+                        bids.clear()
+                        asks.clear()
+                        continue
+                    buf.append(bb, ba)
+                    if buf.should_rotate():
+                        buf.flush()
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("[bitso/%s] %s - retry in %.0fs", asset, e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+
+# ------------------------------------------------------------------
+# MONITOR
+# ------------------------------------------------------------------
+
+async def monitor_loop(
+    buffers: Dict[str, Dict[str, TickBuffer]],
+    assets:  list[str],
+) -> None:
+    """Log buffer sizes every 5 minutes. Confirms data is flowing."""
+    while True:
+        await asyncio.sleep(300)
+        lines = ["--- Buffer status ---"]
+        for asset in assets:
+            for exch, buf in buffers[asset].items():
+                age = time.time() - buf._start
+                lines.append(
+                    f"  {asset}/{exch}: {buf.size()} rows  "
+                    f"age={age/60:.1f}min  file={buf.filename.name}"
+                )
+        log.info("\n".join(lines))
+
+
+# ------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------
+
+async def run(assets: list[str]) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    Path("logs").mkdir(exist_ok=True)
+
+    # Build one buffer per asset/exchange
+    buffers: Dict[str, Dict[str, TickBuffer]] = {}
+    tasks   = []
+
+    for asset in assets:
+        buffers[asset] = {
+            "binance":  TickBuffer(asset, "binance"),
+            "coinbase": TickBuffer(asset, "coinbase"),
+            "bitso":    TickBuffer(asset, "bitso"),
+        }
+        tasks += [
+            asyncio.create_task(
+                feed_binance(asset,  buffers[asset]["binance"]),
+                name=f"binance_{asset}",
+            ),
+            asyncio.create_task(
+                feed_coinbase(asset, buffers[asset]["coinbase"]),
+                name=f"coinbase_{asset}",
+            ),
+            asyncio.create_task(
+                feed_bitso(asset,    buffers[asset]["bitso"]),
+                name=f"bitso_{asset}",
+            ),
+        ]
+
+    tasks.append(asyncio.create_task(
+        monitor_loop(buffers, assets), name="monitor",
+    ))
+
+    log.info("=" * 60)
+    log.info("unified_recorder.py started")
+    log.info("Assets:   %s", ", ".join(a.upper() for a in assets))
+    log.info("Rotation: every %d min", ROTATE_SEC // 60)
+    log.info("Output:   %s/", DATA_DIR)
+    log.info("Naming:   {asset}_{exchange}_{YYYYMMDD}_{HHMMSS}.parquet")
+    log.info("=" * 60)
+
+    def _flush_all(reason: str = "shutdown") -> None:
+        for asset in assets:
+            for buf in buffers[asset].values():
+                buf.flush(reason=reason)
+
+    try:
+        await asyncio.gather(*tasks)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        for t in tasks:
+            t.cancel()
+        _flush_all("shutdown")
+        log.info("All buffers flushed. Goodbye.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Multi-asset lead-lag recorder")
+    parser.add_argument(
+        "--assets",
+        nargs="+",
+        choices=["btc", "eth", "sol"],
+        default=["btc", "eth", "sol"],
+        help="Assets to record (default: btc eth sol)",
+    )
+    args = parser.parse_args()
+
+    try:
+        asyncio.run(run(args.assets))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
