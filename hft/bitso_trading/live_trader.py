@@ -1,7 +1,71 @@
 #!/usr/bin/env python3
 """
-live_trader.py  v3.8  — crossed-book threshold calibrated
+live_trader.py  v3.11  — crossed-book threshold calibrated
 Lead-lag live trading: Coinbase + BinanceUS -> Bitso
+
+CHANGES v3.10 -> v3.11  (cancel+fill race protection)
+
+  Remaining orphan source identified: _cancel_unfilled_entry race.
+  When entry order is cancelled at time_stop, Bitso can fill the order
+  AND acknowledge the cancel simultaneously. BTC appears in account but
+  system thinks entry never filled (ORPHAN). Cooldown was only 8s here
+  vs 45s in reconciler resets — insufficient for Bitso settlement.
+  Fix: apply POST_RESET_COOLDOWN (45s) in _cancel_unfilled_entry.
+  All three orphan-producing paths now have 45s cooldown:
+    Case A: reconciler orphan sell
+    Case B: reconciler silent fill reset
+    Case C: _cancel_unfilled_entry (new)
+
+CHANGES v3.9 -> v3.10  (two-speed stale threshold)
+
+  ROOT CAUSE: stale feed while IN_POSITION swallows stop losses.
+  Stop loss set at -8 bps. Feed goes stale 30s. Price falls to -16 bps
+  during blind window. handle_exit cannot fire without valid ticks.
+  When feed reconnects, first tick sees -16.9 bps — double the intended
+  maximum loss. This cannot be fixed by tightening stop loss bps because
+  the loss happens entirely within the blind window.
+
+  Fix: two-speed stale threshold in bitso_feed.
+    IN_POSITION:  stale_threshold = 8s  (reconnect fast, protect open trades)
+    FLAT:         stale_threshold = STALE_RECONNECT_SEC (default 30s)
+
+  When holding a position, an 8s blind window is the maximum tolerated.
+  At BTC volatility of ~0.5-1%/min, 8s exposure adds ~0.07-0.13 bps of
+  extra stop loss slippage — acceptable. 30s adds 2.5 bps — not acceptable.
+
+  When flat, 30s is correct. No position at risk. Avoids the excessive
+  reconnect frequency that caused orphan events in earlier versions.
+
+CHANGES v3.8 -> v3.9  (orphan race condition fix)
+
+  ROOT CAUSE IDENTIFIED from 16h live trading diagnostic:
+  7 orphan events + 1 nuclear exit cost estimated $62 in forced slippage
+  against a gross strategy P&L of $62/day — breaking even on a
+  profitable strategy.
+
+  The Bitso balance API shows 0 for 2-10 seconds after a fill
+  (settlement lag). The reconciler fires during this window, sees
+  asset_bal=0, performs a SILENT FILL reset, sets cooldown=8s.
+  Signal fires 8s later, orphan guard REST call also returns 0.
+  New entry placed. Original BTC from prior fill appears. Orphan.
+
+  Fix 1: STALE_RECONNECT_SEC default raised from 15s to 30s.
+    15s was causing reconnects every 15-20s continuously, keeping
+    BT above 5s threshold, blocking handle_exit, routing 88% of
+    exits through the reconciler (15-30s delayed detection).
+    30s reduces reconnect frequency while keeping the safety net.
+
+  Fix 2: POST_RESET_COOLDOWN = 45s after every reconciler reset.
+    After Case A (orphan sell) and Case B (silent fill reset),
+    last_exit_ts is set to time.time() + 37s (45s - 8s cooldown).
+    This gives the Bitso balance API full time to settle before
+    any new entry is allowed. Eliminates the race condition.
+
+  Fix 3: SOL terminated. 27 live trades at -2.168 bps avg confirms
+    structural unprofitability. Tick cost of 1.17 bps/tick at $85
+    combined with 100% reconciler exits creates unavoidable losses.
+
+  Audit findings from v3.8 remain valid. No other changes.
 
 CHANGES v3.7 -> v3.8  (full state machine audit)
   Fix 1: PnL size accounting mismatch.
@@ -219,7 +283,8 @@ EXIT_CHASE_SEC       = float(os.environ.get("EXIT_CHASE_SEC",       "8.0"))
 FORCE_CLOSE_SLIPPAGE = float(os.environ.get("FORCE_CLOSE_SLIPPAGE", "0.005"))
 RECONCILE_SEC        = float(os.environ.get("RECONCILE_SEC",        "30.0"))
 ENTRY_SLIPPAGE_TICKS = int(os.environ.get("ENTRY_SLIPPAGE_TICKS",   "2"))    # ticks above ask on buy entry
-STALE_RECONNECT_SEC  = float(os.environ.get("STALE_RECONNECT_SEC",  "15.0")) # seconds of no valid Bitso tick before reconnect
+STALE_RECONNECT_SEC  = float(os.environ.get("STALE_RECONNECT_SEC",  "30.0")) # seconds of no valid Bitso tick before reconnect
+POST_RESET_COOLDOWN  = float(os.environ.get("POST_RESET_COOLDOWN",  "45.0")) # seconds to block new entries after reconciler reset
 
 _MIN_SIZES     = {"btc": 0.00001, "eth": 0.0001, "sol": 0.001}
 MIN_TRADE_SIZE = _MIN_SIZES.get(ASSET, 0.00001)
@@ -387,7 +452,7 @@ class PnLTracker:
     def summary_text(self, mode: str, runtime_hr: float) -> str:
         trades_hr = self.n_trades / max(runtime_hr, 0.01)
         return "\n".join([
-            f"Bitso Lead-Lag v3.8 [{mode.upper()}] {ASSET.upper()}",
+            f"Bitso Lead-Lag v3.11 [{mode.upper()}] {ASSET.upper()}",
             f"Runtime:      {runtime_hr:.1f}h",
             f"Trades:       {self.n_trades}  ({trades_hr:.1f}/hr)",
             f"Win rate:     {self.win_rate*100:.0f}%  ({self.n_wins}W/{self.n_trades-self.n_wins}L)",
@@ -768,7 +833,14 @@ async def _cancel_unfilled_entry(risk: "RiskState") -> None:
     At attempt 0, no exit order has been submitted yet, so "no asset"
     means the ENTRY order never filled — not that the exit filled silently.
     Cancel the open entry order and clear all state WITHOUT recording a trade.
-    The reconciler will catch it if the entry fills after this call.
+
+    IMPORTANT: Apply POST_RESET_COOLDOWN here too.
+    The cancel request and the order fill can race on Bitso's side.
+    If the order fills in the same millisecond the cancel arrives,
+    Bitso fills the order AND acknowledges the cancel. BTC appears in
+    the account but the system thinks the entry never filled → ORPHAN.
+    POST_RESET_COOLDOWN gives the reconciler time to detect and sell
+    any BTC that snuck through before the next entry is allowed.
     """
     oid = risk.entry_oid
     log.warning(
@@ -784,7 +856,13 @@ async def _cancel_unfilled_entry(risk: "RiskState") -> None:
     risk.exit_oid           = ""
     risk.exit_attempt       = 0
     risk.last_exit_api_call = 0.0
-    risk.last_exit_ts       = time.time()
+    # Apply POST_RESET_COOLDOWN to guard against cancel+fill race condition.
+    risk.last_exit_ts = time.time() + POST_RESET_COOLDOWN - COOLDOWN_SEC
+    log.warning(
+        "[%s] ENTRY UNFILLED cooldown: blocking entries for %.0fs "
+        "(cancel+fill race protection).",
+        EXEC_MODE.upper(), POST_RESET_COOLDOWN,
+    )
 
 
 async def handle_exit(
@@ -1001,6 +1079,16 @@ async def reconciler_loop(
                 )
                 log.error("[Reconciler] %s", msg.replace('\n', ' | '))
                 await tg(msg)
+            # Block new entries for POST_RESET_COOLDOWN seconds.
+            # Orphan events happen because the Bitso balance API shows 0 briefly
+            # after a fill (settlement lag), triggering a false SILENT FILL reset,
+            # then a new entry fires before the balance settles and the original
+            # asset reappears. A 45s cooldown fully covers the settlement window.
+            risk.last_exit_ts = time.time() + POST_RESET_COOLDOWN - COOLDOWN_SEC
+            log.warning(
+                "[Reconciler] ORPHAN cooldown: blocking entries for %.0fs.",
+                POST_RESET_COOLDOWN,
+            )
 
         # ── Case B: Silent fill ────────────────────────────────────
         # Internal=IN_POSITION but no asset in account.
@@ -1016,9 +1104,21 @@ async def reconciler_loop(
                 asset_bal, ASSET.upper(),
             )
             _reset_position(risk, pnl, current_mid, hold_sec, "reconcile_silent_fill")
+            # Extend cooldown beyond the 8s set by _reset_position.
+            # Root cause of orphan events: Bitso balance API shows 0 for a few
+            # seconds after a fill (settlement lag). Without this extension, a
+            # new entry can fire during the 0-balance window, the original asset
+            # then reappears, and we have two positions stacked.
+            # POST_RESET_COOLDOWN (45s) covers the full Bitso settlement window.
+            risk.last_exit_ts = time.time() + POST_RESET_COOLDOWN - COOLDOWN_SEC
+            log.warning(
+                "[Reconciler] SILENT FILL cooldown: blocking entries for %.0fs.",
+                POST_RESET_COOLDOWN,
+            )
             await tg(
                 f"RECONCILER SILENT FILL [{EXEC_MODE.upper()}] {ASSET.upper()}\n"
-                f"Position reset and trade recorded."
+                f"Position reset and trade recorded.\n"
+                f"Entry blocked for {POST_RESET_COOLDOWN:.0f}s (balance settlement)."
             )
 
         # ── Case C: Stuck force close ──────────────────────────────
@@ -1165,11 +1265,21 @@ async def bitso_feed(state: MarketState, risk: RiskState, pnl: PnLTracker):
                     # bitso.age() grows indefinitely (the v3.2/v3.5 failure mode).
                     # Only activates after 15s of connection age to allow the
                     # initial snapshot to populate.
-                    if (state.bitso.age() > STALE_RECONNECT_SEC
+                    #
+                    # TWO-SPEED THRESHOLD:
+                    # When IN_POSITION: 8s max stale. A 30s blind window while
+                    # holding a position means a stop loss at -8 bps becomes -16 bps
+                    # because handle_exit cannot fire without valid ticks. Reconnect
+                    # fast to protect open positions.
+                    # When FLAT: 30s max stale. No position at risk, so we can
+                    # tolerate longer quiet periods without unnecessary reconnects
+                    # that previously caused orphan events.
+                    stale_threshold = 8.0 if risk.in_position() else STALE_RECONNECT_SEC
+                    if (state.bitso.age() > stale_threshold
                             and time.time() - connect_ts > 15.0):
                         log.warning(
-                            "[Bitso] No valid tick for %.0fs — reconnecting.",
-                            state.bitso.age(),
+                            "[Bitso] No valid tick for %.0fs (in_position=%s) — reconnecting.",
+                            state.bitso.age(), risk.in_position(),
                         )
                         break
 
@@ -1302,7 +1412,7 @@ async def startup_checks() -> bool:
 
 async def main():
     log.info("=" * 66)
-    log.info("Bitso Lead-Lag Trader v3.8  |  %s  |  %s",
+    log.info("Bitso Lead-Lag Trader v3.11  |  %s  |  %s",
              ASSET.upper(), EXEC_MODE.upper())
     log.info("Book: %s  Binance: %s  Coinbase: %s",
              BITSO_BOOK, BINANCE_SYMBOL, COINBASE_SYMBOL)
@@ -1325,7 +1435,7 @@ async def main():
     pnl   = PnLTracker()
 
     await tg(
-        f"Bitso Lead-Lag v3.8 [{EXEC_MODE.upper()}] {ASSET.upper()} started\n"
+        f"Bitso Lead-Lag v3.11 [{EXEC_MODE.upper()}] {ASSET.upper()} started\n"
         f"Book: {BITSO_BOOK}  Threshold: {ENTRY_THRESHOLD_BPS}bps  Window: {SIGNAL_WINDOW_SEC}s\n"
         f"Size: {MAX_POS_ASSET} {ASSET.upper()}  Limit: ${MAX_DAILY_LOSS_USD}\n"
         f"Force close: {FORCE_CLOSE_SLIPPAGE*100:.1f}%  Reconciler: {int(RECONCILE_SEC)}s"
