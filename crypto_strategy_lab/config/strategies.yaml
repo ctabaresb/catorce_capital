@@ -268,3 +268,125 @@ strategies:
       min_tradability:           35.0
       max_impact_spread_bps:    15.0
       top_pct:                   0.35
+
+  # ── High-frequency HL strategies (designed for 5+ days of data) ───────────
+  # These fire more often than the HL perp strategies above.
+  # All require build_features_hl.py parquets.
+
+  bb_squeeze_breakout_long:
+    module:    strategies.bb_squeeze_breakout
+    class:     BB_SqueezeBreakout_Long
+    direction: long
+    # STATUS: UNTESTED
+    # Hypothesis: BB compression resolves upward with non-negative funding
+    # Confidence: 45%
+    params:
+      squeeze_pctile_thresh:  0.40
+      expansion_factor:       1.02
+      min_bar_ret_bps:        0.0
+      max_funding_8h:        -0.0003
+      max_vov_ratio:          3.0
+      min_slope_bps:         -8.0
+      max_dist_below_ema:    -0.07
+      min_tradability:        20.0
+      max_impact_spread_bps:  25.0
+      top_pct:                0.50
+
+  bb_squeeze_breakout_short:
+    module:    strategies.bb_squeeze_breakout
+    class:     BB_SqueezeBreakout_Short
+    direction: short
+    # STATUS: UNTESTED
+    # Hypothesis: BB compression resolves downward with non-positive funding
+    # Confidence: 45%
+    params:
+      squeeze_pctile_thresh:  0.40
+      expansion_factor:       1.02
+      max_bar_ret_bps:        0.0
+      min_funding_8h:         0.0003
+      max_vov_ratio:          3.0
+      max_slope_bps:          8.0
+      max_dist_above_ema:     0.07
+      min_tradability:        20.0
+      max_impact_spread_bps:  25.0
+      top_pct:                0.50
+
+  dom_absorption_long:
+    module:    strategies.dom_absorption
+    class:     DOM_AbsorptionLong
+    direction: long
+    # STATUS: UNTESTED
+    # Hypothesis: ask-heavy book + price holding = sell pressure absorbed
+    # Confidence: 40%
+    params:
+      imbalance_thresh:       -0.10
+      min_bar_ret_bps:        -5.0
+      wimb_min:               -0.20
+      max_funding_8h:         -0.0003
+      min_slope_bps:          -10.0
+      max_dist_below_ema:     -0.08
+      max_vov_ratio:           4.0
+      min_tradability:         15.0
+      max_impact_spread_bps:   30.0
+      top_pct:                 0.55
+
+  dom_absorption_short:
+    module:    strategies.dom_absorption
+    class:     DOM_AbsorptionShort
+    direction: short
+    # STATUS: UNTESTED
+    # Hypothesis: bid-heavy book + price holding = buy pressure absorbed
+    # Confidence: 40%
+    params:
+      imbalance_thresh:        0.10
+      max_bar_ret_bps:         5.0
+      wimb_max:                0.20
+      min_funding_8h:          0.0003
+      max_slope_bps:           10.0
+      max_dist_above_ema:      0.08
+      max_vov_ratio:           4.0
+      min_tradability:         15.0
+      max_impact_spread_bps:   30.0
+      top_pct:                 0.55
+
+  funding_momentum_long:
+    module:    strategies.funding_momentum
+    class:     Funding_Momentum_Long
+    direction: long
+    # STATUS: UNTESTED — frequency looks good (~5% of bars on synthetic)
+    # Hypothesis: funding trending positive bar-over-bar = short squeeze building
+    # NOTE: funding is constant between 8h settlements — comparison is bar-over-bar
+    # Confidence: 42%
+    params:
+      require_rising_intrabar: true
+      min_funding_change:      0.000005
+      max_funding_zscore:      1.2
+      min_bar_ret_bps:        -5.0
+      min_vol_zscore:         -0.5
+      min_slope_bps:          -6.0
+      max_dist_below_ema:     -0.06
+      max_vov_ratio:           3.0
+      min_tradability:         30.0
+      max_impact_spread_bps:   20.0
+      top_pct:                 0.40
+
+  funding_momentum_short:
+    module:    strategies.funding_momentum
+    class:     Funding_Momentum_Short
+    direction: short
+    # STATUS: UNTESTED — best frequency candidate
+    # Hypothesis: funding declining bar-over-bar = long squeeze building
+    # NOTE: funding is constant between 8h settlements — comparison is bar-over-bar
+    # Confidence: 42%
+    params:
+      require_falling_intrabar: true
+      min_funding_change:       0.000005
+      min_funding_zscore:      -1.2
+      max_bar_ret_bps:          5.0
+      min_vol_zscore:          -0.5
+      max_slope_bps:            6.0
+      max_dist_above_ema:       0.06
+      max_vov_ratio:            3.0
+      min_tradability:          30.0
+      max_impact_spread_bps:    20.0
+      top_pct:                  0.40
