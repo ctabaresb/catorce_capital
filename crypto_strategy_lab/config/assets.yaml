@@ -34,6 +34,7 @@ exchanges:
   hyperliquid:
     bucket: hyperliquid-orderbook
     dom_prefix: hyperliquid_dom_parquet/
+    indicators_prefix: hyperliquid_metrics_parquet/   # per-minute market indicators (funding, OI, premium, volume)
     book_map:
       btc_usd: BTC
       eth_usd: ETH
@@ -87,8 +88,9 @@ feature_build:
 # Output directories
 # ============================================================
 output:
-  raw_dir:      data/artifacts_raw       # download_raw.py writes here
-  features_dir: data/artifacts_features  # build_features.py writes here
-  # Raw naming:      {exchange}_{asset}_{days}d_raw.parquet
-  # Features naming: features_decision_{timeframe}_{exchange}_{asset}_{days}d.parquet
-  # Minute naming:   features_minute_{exchange}_{asset}_{days}d.parquet
+  raw_dir:      data/artifacts_raw       # download_raw.py + download_market_indicators.py write here
+  features_dir: data/artifacts_features  # build_features.py + build_features_hl.py write here
+  # Raw naming:        {exchange}_{asset}_{days}d_raw.parquet
+  # Indicator naming:  {exchange}_{asset}_{days}d_indicators.parquet
+  # Features naming:   features_decision_{timeframe}_{exchange}_{asset}_{days}d.parquet
+  # Minute naming:     features_minute_{exchange}_{asset}_{days}d.parquet
