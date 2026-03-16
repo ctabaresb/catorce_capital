@@ -58,4 +58,16 @@ crypto_strategy_lab/scanner/
 *.log
 
 
+# --- Teraform ---
+terraform.tfvars
 
+# Terraform variable files
+*.tfvars
+*.tfvars.json
+
+# Terraform state files
+*.tfstate
+*.tfstate.*
+
+# Terraform cache
+.terraform/

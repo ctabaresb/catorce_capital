@@ -1,0 +1,90 @@
+{
+  "aws_account_id": {
+    "sensitive": false,
+    "type": "string",
+    "value": "454851577001"
+  },
+  "aws_region": {
+    "sensitive": false,
+    "type": "string",
+    "value": "us-east-1"
+  },
+  "coingecko_secret_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:secretsmanager:us-east-1:454851577001:secret:crypto-platform/dev/coingecko-api-key-niFln5"
+  },
+  "data_lake_bucket_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:s3:::crypto-platform-catorce"
+  },
+  "data_lake_bucket_name": {
+    "sensitive": false,
+    "type": "string",
+    "value": "crypto-platform-catorce"
+  },
+  "ecs_execution_role_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:iam::454851577001:role/crypto-platform-dev-ecs-execution"
+  },
+  "ecs_task_role_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:iam::454851577001:role/crypto-platform-dev-ecs-task"
+  },
+  "lambda_ingest_role_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:iam::454851577001:role/crypto-platform-dev-lambda-ingest"
+  },
+  "lambda_transform_role_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:iam::454851577001:role/crypto-platform-dev-lambda-transform"
+  },
+  "pipeline_alerts_topic_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:sns:us-east-1:454851577001:crypto-platform-dev-pipeline-alerts"
+  },
+  "pipeline_config_secret_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:secretsmanager:us-east-1:454851577001:secret:crypto-platform/dev/pipeline-config-Yrf9mE"
+  },
+  "s3_paths": {
+    "sensitive": false,
+    "type": [
+      "object",
+      {
+        "bronze_history": "string",
+        "bronze_markets": "string",
+        "gold_audit": "string",
+        "gold_backtest": "string",
+        "gold_simulations": "string",
+        "gold_weights": "string",
+        "silver_prices": "string",
+        "silver_returns": "string",
+        "silver_universe": "string"
+      }
+    ],
+    "value": {
+      "bronze_history": "s3://crypto-platform-catorce/bronze/coingecko/history/",
+      "bronze_markets": "s3://crypto-platform-catorce/bronze/coingecko/markets/",
+      "gold_audit": "s3://crypto-platform-catorce/gold/audit/",
+      "gold_backtest": "s3://crypto-platform-catorce/gold/backtest/",
+      "gold_simulations": "s3://crypto-platform-catorce/gold/simulations/",
+      "gold_weights": "s3://crypto-platform-catorce/gold/weights/",
+      "silver_prices": "s3://crypto-platform-catorce/silver/prices/",
+      "silver_returns": "s3://crypto-platform-catorce/silver/returns/",
+      "silver_universe": "s3://crypto-platform-catorce/silver/universe/"
+    }
+  },
+  "step_functions_role_arn": {
+    "sensitive": false,
+    "type": "string",
+    "value": "arn:aws:iam::454851577001:role/crypto-platform-dev-step-functions"
+  }
+}

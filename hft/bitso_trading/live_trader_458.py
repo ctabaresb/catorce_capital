@@ -1,24 +1,7 @@
 #!/usr/bin/env python3
 """
-live_trader.py  v4.5.9  — crossed-book threshold calibrated
+live_trader.py  v4.5.8  — crossed-book threshold calibrated
 Lead-lag live trading: Coinbase + BinanceUS -> Bitso
-
-CHANGES v4.5.8 -> v4.5.9  (orphan settlement buffer)
-
-  Root cause of orphans (9 in 24 trades = 38% of trades):
-  Passive limit partially fills across multiple poll cycles.
-  Poller cancels remainder, market order fills the rest.
-  _reset_position called: last_exit_ts = time.time().
-  At T+8s (COOLDOWN_SEC), orphan guard calls _check_balance().
-  Bitso balance shows 0 BTC — orphan guard passes, entry fires.
-  At T+9-12s: passive limit partial fill BTC settles on Bitso.
-  Reconciler sees BTC in account with internal=FLAT → ORPHAN.
-
-  Fix: last_exit_ts = time.time() + 5.0
-  This extends the effective cooldown from 8s to 13s.
-  Bitso partial fill settlement always completes within 5-8s.
-  At T+13s: all settlements done, balance check is accurate.
-  No orphan. One-line change, zero impact on any other logic.
 
 CHANGES v4.5.7 -> v4.5.8  (stop loss → immediate market order)
 
@@ -744,7 +727,7 @@ class PnLTracker:
     def summary_text(self, mode: str, runtime_hr: float) -> str:
         trades_hr = self.n_trades / max(runtime_hr, 0.01)
         return "\n".join([
-            f"Bitso Lead-Lag v4.5.9 [{mode.upper()}] {ASSET.upper()}",
+            f"Bitso Lead-Lag v4.5.8 [{mode.upper()}] {ASSET.upper()}",
             f"Runtime:      {runtime_hr:.1f}h",
             f"Trades:       {self.n_trades}  ({trades_hr:.1f}/hr)",
             f"Win rate:     {self.win_rate*100:.0f}%  ({self.n_wins}W/{self.n_trades-self.n_wins}L)",
@@ -1219,12 +1202,7 @@ def _reset_position(
     risk.ws_fill_detected   = False
     risk.ws_fill_price      = 0.0
     risk.ws_filled_oid      = ""
-    # Settlement buffer: Bitso partial fill settlements can arrive 3-8s after
-    # the final exit order fills. Without this buffer, the orphan guard balance
-    # check fires at COOLDOWN_SEC (8s) and sees 0 BTC — passes — entry fires —
-    # then the partial fill BTC arrives and becomes an orphan.
-    # +5s buffer means orphan guard runs at T+13s, after all settlements complete.
-    risk.last_exit_ts       = time.time() + 5.0
+    risk.last_exit_ts       = time.time()
     risk.check_daily_loss(pnl)
 
 
@@ -2240,7 +2218,7 @@ async def startup_checks() -> bool:
 
 async def main():
     log.info("=" * 66)
-    log.info("Bitso Lead-Lag Trader v4.5.9  |  %s  |  %s",
+    log.info("Bitso Lead-Lag Trader v4.5.8  |  %s  |  %s",
              ASSET.upper(), EXEC_MODE.upper())
     log.info("Book: %s  Binance: %s  Coinbase: %s",
              BITSO_BOOK, BINANCE_SYMBOL, COINBASE_SYMBOL)
@@ -2263,7 +2241,7 @@ async def main():
     pnl   = PnLTracker()
 
     await tg(
-        f"Bitso Lead-Lag v4.5.9 [{EXEC_MODE.upper()}] {ASSET.upper()} started\n"
+        f"Bitso Lead-Lag v4.5.8 [{EXEC_MODE.upper()}] {ASSET.upper()} started\n"
         f"Book: {BITSO_BOOK}  Threshold: {ENTRY_THRESHOLD_BPS}bps  Window: {SIGNAL_WINDOW_SEC}s\n"
         f"Size: {MAX_POS_ASSET} {ASSET.upper()}  Limit: ${MAX_DAILY_LOSS_USD}\n"
         f"Force close: {FORCE_CLOSE_SLIPPAGE*100:.1f}%  Reconciler: {int(RECONCILE_SEC)}s"
@@ -2291,7 +2269,7 @@ async def main():
             t.cancel()
         log.info("Shutdown.\n%s", pnl.summary_text(EXEC_MODE, 0))
         _send_telegram_sync(
-            f"Bitso Lead-Lag v4.5.9 STOPPED [{EXEC_MODE.upper()}] {ASSET.upper()}\n"
+            f"Bitso Lead-Lag v4.5.8 STOPPED [{EXEC_MODE.upper()}] {ASSET.upper()}\n"
             + pnl.summary_text(EXEC_MODE, 0)
         )
 
