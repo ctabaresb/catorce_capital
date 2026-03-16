@@ -1,0 +1,25 @@
+# =============================================================================
+# requirements.txt
+# Python dependencies for the crypto platform ingestion layer.
+# Install with: pip install -r requirements.txt
+# =============================================================================
+
+# HTTP client
+requests==2.31.0
+urllib3==2.0.7
+
+# Data processing (ingestion + transform)
+pandas==2.1.4
+pyarrow==14.0.2          # Parquet read/write
+
+# AWS SDK
+boto3==1.34.14
+botocore==1.34.14
+
+# Numerical computing (used in backtest engine, Week 2)
+numpy==1.26.3
+
+# Testing
+pytest==7.4.4
+pytest-mock==3.12.0
+requests-mock==1.11.0

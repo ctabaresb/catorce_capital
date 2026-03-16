@@ -1,0 +1,61 @@
+# =============================================================================
+# terraform.tfvars.example
+#
+# INSTRUCTIONS:
+#   1. Copy this file: cp terraform.tfvars.example terraform.tfvars
+#   2. Fill in every value marked with <REPLACE>
+#   3. NEVER commit terraform.tfvars to git (it contains your API key)
+#   4. Add terraform.tfvars to .gitignore
+#
+# This file IS safe to commit - it contains no real values.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Core project settings
+# ---------------------------------------------------------------------------
+project_name = "crypto-platform"
+environment  = "dev"           # dev | staging | prod
+aws_region   = "us-east-1"
+owner        = "<YOUR_NAME>"   # e.g. "john-smith"
+
+# ---------------------------------------------------------------------------
+# S3 bucket name - MUST be globally unique across all AWS accounts
+# Recommended: {project}-{env}-{your_aws_account_id_last_6_digits}
+# Example: crypto-platform-dev-789012
+# ---------------------------------------------------------------------------
+data_lake_bucket_name = "<REPLACE_WITH_UNIQUE_BUCKET_NAME>"
+
+# ---------------------------------------------------------------------------
+# CoinGecko API key
+# Free tier: you can use "free-tier" as a placeholder - no key required
+#            for basic endpoints but rate limits are strict (~30/min)
+# Pro tier:  paste your actual key from pro.coingecko.com/api/dashboard
+# ---------------------------------------------------------------------------
+coingecko_api_key = "<REPLACE_WITH_API_KEY_OR_free-tier>"
+coingecko_plan    = "free"     # free | pro
+
+# ---------------------------------------------------------------------------
+# Pipeline settings
+# ---------------------------------------------------------------------------
+universe_size         = 100    # number of assets by market cap to ingest
+ingest_cron_schedule  = "cron(30 0 * * ? *)"   # 00:30 UTC daily
+
+# ---------------------------------------------------------------------------
+# Lambda settings
+# ---------------------------------------------------------------------------
+lambda_timeout_seconds = 120
+lambda_memory_mb       = 256
+
+# ---------------------------------------------------------------------------
+# Lifecycle retention (days)
+# ---------------------------------------------------------------------------
+bronze_retention_days     = 90
+silver_retention_days     = 730
+simulation_retention_days = 30
+backtest_retention_days   = 365
+
+# ---------------------------------------------------------------------------
+# Alerting (optional but recommended)
+# Leave blank to skip email subscription
+# ---------------------------------------------------------------------------
+alert_email = ""   # e.g. "you@email.com"
