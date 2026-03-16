@@ -1,42 +1,7 @@
 #!/usr/bin/env python3
 """
-live_trader.py  v4.5.9  — crossed-book threshold calibrated
+live_trader.py  v4.5.7  — crossed-book threshold calibrated
 Lead-lag live trading: Coinbase + BinanceUS -> Bitso
-
-CHANGES v4.5.8 -> v4.5.9  (orphan settlement buffer)
-
-  Root cause of orphans (9 in 24 trades = 38% of trades):
-  Passive limit partially fills across multiple poll cycles.
-  Poller cancels remainder, market order fills the rest.
-  _reset_position called: last_exit_ts = time.time().
-  At T+8s (COOLDOWN_SEC), orphan guard calls _check_balance().
-  Bitso balance shows 0 BTC — orphan guard passes, entry fires.
-  At T+9-12s: passive limit partial fill BTC settles on Bitso.
-  Reconciler sees BTC in account with internal=FLAT → ORPHAN.
-
-  Fix: last_exit_ts = time.time() + 5.0
-  This extends the effective cooldown from 8s to 13s.
-  Bitso partial fill settlement always completes within 5-8s.
-  At T+13s: all settlements done, balance check is accurate.
-  No orphan. One-line change, zero impact on any other logic.
-
-CHANGES v4.5.7 -> v4.5.8  (stop loss → immediate market order)
-
-  Root cause of session-destroying losses identified from live data:
-  Trade 17 on 2026-03-14: stop loss triggered at -8 bps, final loss -29 bps.
-  The 21 extra bps came from submitting a passive limit on stop loss.
-  When BTC is moving fast against us, the bid drops every tick.
-  The passive limit sat unfilled for EXIT_CHASE_SEC (8s) while bid dropped.
-  8 seconds in a fast market = 20+ bps of additional loss.
-  This one trade cost .16 and turned a +.04 session into -.12.
-
-  Fix: split stop loss vs time stop exit logic.
-  STOP LOSS → immediate market order (costs ~1.35 bps, guaranteed fill).
-  TIME STOP → passive limit first (free if fills), market fallback after 8s.
-
-  Stop losses need instant execution — saving 1.35 bps is never worth
-  risking 20+ bps of overshoot during a fast adverse move.
-  Time stops fire when market is stable — passive limit can collect spread.
 
 CHANGES v4.5.6 -> v4.5.7  (PnL zero + orphan after partial exit fix)
 
@@ -744,7 +709,7 @@ class PnLTracker:
     def summary_text(self, mode: str, runtime_hr: float) -> str:
         trades_hr = self.n_trades / max(runtime_hr, 0.01)
         return "\n".join([
-            f"Bitso Lead-Lag v4.5.9 [{mode.upper()}] {ASSET.upper()}",
+            f"Bitso Lead-Lag v4.5.7 [{mode.upper()}] {ASSET.upper()}",
             f"Runtime:      {runtime_hr:.1f}h",
             f"Trades:       {self.n_trades}  ({trades_hr:.1f}/hr)",
             f"Win rate:     {self.win_rate*100:.0f}%  ({self.n_wins}W/{self.n_trades-self.n_wins}L)",
@@ -1219,12 +1184,7 @@ def _reset_position(
     risk.ws_fill_detected   = False
     risk.ws_fill_price      = 0.0
     risk.ws_filled_oid      = ""
-    # Settlement buffer: Bitso partial fill settlements can arrive 3-8s after
-    # the final exit order fills. Without this buffer, the orphan guard balance
-    # check fires at COOLDOWN_SEC (8s) and sees 0 BTC — passes — entry fires —
-    # then the partial fill BTC arrives and becomes an orphan.
-    # +5s buffer means orphan guard runs at T+13s, after all settlements complete.
-    risk.last_exit_ts       = time.time() + 5.0
+    risk.last_exit_ts       = time.time()
     risk.check_daily_loss(pnl)
 
 
@@ -1417,8 +1377,8 @@ async def handle_exit(
         reason = "stop_loss" if is_stop_loss else ("time_stop" if is_time_stop else None)
         if reason is None:
             return
-        # Floor guard for time stops only.
-        # Stop losses must never be deferred — the market is already moving against us.
+        # Floor guard: avoid exiting into a temporarily depressed bid.
+        # Cap deferral at 2x HOLD_SEC to prevent indefinite trapping.
         max_deferral = hold_sec >= HOLD_SEC * 2
         if (exit_side == "sell" and floor_px
                 and passive_px < floor_px
@@ -1431,27 +1391,7 @@ async def handle_exit(
         if now_ts - risk.last_exit_api_call < 2.0:
             return
 
-        # STOP LOSS → immediate market order.
-        # When price is moving against us, a passive limit at bid will not fill
-        # for up to EXIT_CHASE_SEC (8s) while the bid drops further.
-        # 8s of fast-moving BTC = 20+ bps additional loss (confirmed in live logs).
-        # Market order costs ~1.35 bps. Passive limit overshoot costs 20-50 bps.
-        if is_stop_loss:
-            log.warning("[%s] EXIT STOP LOSS (MARKET): %s  pnl=%.3fbps — direct market order.",
-                        EXEC_MODE.upper(), exit_side.upper(), pnl_bps_live)
-            risk.last_exit_api_call = time.time()
-            result = await _submit_market_order(exit_side, abs(risk.position_asset))
-            if result.get("success"):
-                risk.exit_oid          = result.get("oid", "")
-                risk.exit_submitted_ts = time.time()
-                risk.exit_attempt      = 2   # skip to attempt 2 — market already submitted
-                log.info("[%s] STOP LOSS market order submitted oid=%s",
-                         EXEC_MODE.upper(), risk.exit_oid)
-            elif result.get("error") in _NO_ASSET_ERRORS:
-                await _cancel_unfilled_entry(risk, state, pnl)
-            return
-
-        # TIME STOP → passive limit first (free if fills), market fallback after 8s.
+        # Attempt 1: passive limit at bid — collects spread, zero cost if fills.
         log.info("[%s] EXIT attempt 1 (passive limit): %s @ $%.2f  pnl=%.3fbps  %s",
                  EXEC_MODE.upper(), exit_side.upper(), passive_px, pnl_bps_live, reason)
         risk.last_exit_api_call = time.time()
@@ -2240,7 +2180,7 @@ async def startup_checks() -> bool:
 
 async def main():
     log.info("=" * 66)
-    log.info("Bitso Lead-Lag Trader v4.5.9  |  %s  |  %s",
+    log.info("Bitso Lead-Lag Trader v4.5.7  |  %s  |  %s",
              ASSET.upper(), EXEC_MODE.upper())
     log.info("Book: %s  Binance: %s  Coinbase: %s",
              BITSO_BOOK, BINANCE_SYMBOL, COINBASE_SYMBOL)
@@ -2263,7 +2203,7 @@ async def main():
     pnl   = PnLTracker()
 
     await tg(
-        f"Bitso Lead-Lag v4.5.9 [{EXEC_MODE.upper()}] {ASSET.upper()} started\n"
+        f"Bitso Lead-Lag v4.5.7 [{EXEC_MODE.upper()}] {ASSET.upper()} started\n"
         f"Book: {BITSO_BOOK}  Threshold: {ENTRY_THRESHOLD_BPS}bps  Window: {SIGNAL_WINDOW_SEC}s\n"
         f"Size: {MAX_POS_ASSET} {ASSET.upper()}  Limit: ${MAX_DAILY_LOSS_USD}\n"
         f"Force close: {FORCE_CLOSE_SLIPPAGE*100:.1f}%  Reconciler: {int(RECONCILE_SEC)}s"
@@ -2291,7 +2231,7 @@ async def main():
             t.cancel()
         log.info("Shutdown.\n%s", pnl.summary_text(EXEC_MODE, 0))
         _send_telegram_sync(
-            f"Bitso Lead-Lag v4.5.9 STOPPED [{EXEC_MODE.upper()}] {ASSET.upper()}\n"
+            f"Bitso Lead-Lag v4.5.7 STOPPED [{EXEC_MODE.upper()}] {ASSET.upper()}\n"
             + pnl.summary_text(EXEC_MODE, 0)
         )
 
