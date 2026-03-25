@@ -390,3 +390,27 @@ strategies:
       min_tradability:          30.0
       max_impact_spread_bps:    20.0
       top_pct:                  0.40
+
+  funding_carry_harvest:
+    module:    strategies.funding_carry_harvest
+    class:     FundingCarryHarvest
+    direction: long
+    # STATUS: UNTESTED
+    # Hypothesis: negative funding = longs receive carry at each settlement.
+    # Carry received directly offsets taker cost. Profit source is cash flow,
+    # not price prediction. Max observed funding: -0.0284% per 8h = 28.4 bps.
+    # Round-trip taker cost: 7 bps. Net carry at threshold: +3 bps minimum.
+    # This is the only strategy where signal generates direct cash flow.
+    # Confidence: 60%
+    # Risk: adverse price move wipes carry. Carry is bounded, losses are not.
+    params:
+      min_funding_threshold:   -0.001     # -0.10% per 8h = 10 bps carry
+      min_consecutive_bars:     4         # funding negative for 1h+ before entry
+      min_funding_zscore:      -1.0       # OR zscore gate (whichever fires)
+      max_oi_collapse_pct:     -3.0
+      max_vov_ratio:            3.5
+      min_slope_bps:           -8.0
+      max_dist_below_ema:      -0.08
+      min_tradability:          30.0
+      max_impact_spread_bps:    20.0
+      top_pct:                  0.50

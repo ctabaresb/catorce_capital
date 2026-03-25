@@ -167,12 +167,17 @@ def load_strategy(strategy_name: str, strategy_cfg: dict):
 # Output formatting
 # =============================================================================
 
-def print_header(strategy_name: str, run_matrix: list) -> None:
+def print_header(strategy_name: str, run_matrix: list,
+                 execution: str = "taker", fee_tier: str = "tier_0") -> None:
+    from evaluation.evaluator import HL_FEES
+    taker_bps, maker_bps = HL_FEES.get(fee_tier, HL_FEES["tier_0"])
+    fee_bps = maker_bps if execution == "maker" else taker_bps
     print()
     print("=" * 95)
     print(f"  STRATEGY TEST:  {strategy_name}")
     print(f"  Run at:         {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"  Combinations:   {len(run_matrix)}")
+    print(f"  Execution:      {execution.upper()}  |  Fee tier: {fee_tier}  |  HL fee: {fee_bps:.1f} bps round-trip")
     print("=" * 95)
 
 
@@ -248,6 +253,15 @@ def main():
                     help="Restrict to one exchange (e.g. bitso, hyperliquid)")
     ap.add_argument("--horizon",         default=None,
                     help="Override primary_horizon (e.g. H60m, H120m, H240m)")
+    ap.add_argument("--execution",       default="taker",
+                    choices=["taker", "maker"],
+                    help="Execution model: taker (default) or maker (limit orders). "
+                         "Maker uses lower HL fees (3 bps vs 9 bps round-trip at Tier 0).")
+    ap.add_argument("--fee_tier",        default="tier_0",
+                    choices=["tier_0","tier_1","tier_2","tier_3","tier_4","tier_5","tier_6"],
+                    help="HL fee tier (default: tier_0, <$5M 14d volume). "
+                         "tier_0: taker=9bps maker=3bps | tier_2: taker=7bps maker=1.6bps | "
+                         "tier_4: taker=5.6bps maker=0bps (free)")
     ap.add_argument("--out_dir",         default="scanner/results",
                     help="Directory for CSV output")
     args = ap.parse_args()
@@ -268,7 +282,7 @@ def main():
     print(f"\nLoading strategy: {strategy_name}")
     strategy = load_strategy(strategy_name, strategy_cfg)
 
-    print_header(strategy_name, run_matrix)
+    print_header(strategy_name, run_matrix, args.execution, args.fee_tier)
 
     results = []
 
@@ -314,6 +328,8 @@ def main():
             asset=asset,
             exchange=strat_exchange,
             direction=strat_direction,
+            execution=args.execution,
+            fee_tier=args.fee_tier,
             primary_horizon=primary_horizon,
             all_horizons=all_horizons,
             label=label,

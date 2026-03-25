@@ -2,35 +2,23 @@
 """
 unified_recorder.py
 Production-grade multi-asset lead-lag data recorder.
-Records Coinbase + BinanceUS + Bitso order book ticks for BTC, ETH, SOL.
+Records Coinbase + BinanceUS + Bitso order book ticks.
 
-FILE NAMING CONVENTION (always):
+ASSETS RECORDED:
+  btc, eth, sol        — original assets
+  xrp, ada, doge       — altcoin market making candidates (wide spread, high volume)
+  xlm, hbar, dot       — additional market making candidates
+
+FILE NAMING:
   {asset}_{exchange}_{YYYYMMDD}_{HHMMSS}.parquet
-  e.g.  btc_binance_20260308_173200.parquet
-        eth_coinbase_20260308_173200.parquet
-        sol_bitso_20260308_173200.parquet
-
-This replaces:
-  - lead_lag_recorder.py  (BTC only, no asset prefix — legacy)
-  - multi_asset_recorder.py (ETH+SOL, separate process)
-
-MIGRATION NOTE:
-  Legacy BTC files without asset prefix (binance_*.parquet, coinbase_*.parquet,
-  bitso_*.parquet) remain valid in S3. The research script handles both naming
-  conventions via the --legacy-btc flag.
+  e.g. xrp_coinbase_20260318_090000.parquet
 
 USAGE:
-  python3 unified_recorder.py                        # btc eth sol (default)
-  python3 unified_recorder.py --assets btc           # BTC only
-  python3 unified_recorder.py --assets btc eth sol   # all three
+  python3 unified_recorder.py                          # all 9 assets
+  python3 unified_recorder.py --assets xrp ada doge   # specific assets only
+  python3 unified_recorder.py --assets btc eth sol     # original only
 
-ROTATION:
-  New parquet file every ROTATE_SEC seconds (default 3600 = 1 hour).
-  On shutdown (SIGINT/SIGTERM), all buffers flushed immediately.
-
-S3 SYNC:
-  Handled by existing cron: 0 * * * * aws s3 sync data/ s3://bitso-orderbook/data/
-  No changes needed to existing cron.
+ROTATION: New file every ROTATE_SEC (default 3600 = 1 hour)
 """
 from __future__ import annotations
 
@@ -39,7 +27,6 @@ import asyncio
 import logging
 import json
 import os
-import signal
 import time
 from pathlib import Path
 from typing import Dict
@@ -47,17 +34,14 @@ from typing import Dict
 import pandas as pd
 import websockets
 
-# ------------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------------
-
-ROTATE_SEC = int(os.environ.get("ROTATE_SEC", "3600"))  # 1 hour default
-MAX_ROWS   = 500_000   # hard cap per buffer before forced flush
+# ── config ──────────────────────────────────────────────────────────
+ROTATE_SEC = int(os.environ.get("ROTATE_SEC", "3600"))
+MAX_ROWS   = 500_000
 DATA_DIR   = Path(os.environ.get("DATA_DIR", "data"))
 
 ASSET_CONFIG: Dict[str, Dict[str, str]] = {
     "btc": {
-        "binance_stream":  "btcusdt@bookTicker",
+        "binance_stream":   "btcusdt@bookTicker",
         "coinbase_product": "BTC-USD",
         "bitso_book":       "btc_usd",
     },
@@ -71,7 +55,40 @@ ASSET_CONFIG: Dict[str, Dict[str, str]] = {
         "coinbase_product": "SOL-USD",
         "bitso_book":       "sol_usd",
     },
+    "xrp": {
+        "binance_stream":   "xrpusdt@bookTicker",
+        "coinbase_product": "XRP-USD",
+        "bitso_book":       "xrp_usd",
+    },
+    "ada": {
+        "binance_stream":   "adausdt@bookTicker",
+        "coinbase_product": "ADA-USD",
+        "bitso_book":       "ada_usd",
+    },
+    "doge": {
+        "binance_stream":   "dogeusdt@bookTicker",
+        "coinbase_product": "DOGE-USD",
+        "bitso_book":       "doge_usd",
+    },
+    "xlm": {
+        "binance_stream":   "xlmusdt@bookTicker",
+        "coinbase_product": "XLM-USD",
+        "bitso_book":       "xlm_usd",
+    },
+    "hbar": {
+        "binance_stream":   "hbarusdt@bookTicker",
+        "coinbase_product": "HBAR-USD",
+        "bitso_book":       "hbar_usd",
+    },
+    "dot": {
+        "binance_stream":   "dotusdt@bookTicker",
+        "coinbase_product": "DOT-USD",
+        "bitso_book":       "dot_usd",
+    },
 }
+
+ALL_ASSETS   = list(ASSET_CONFIG.keys())
+VALID_ASSETS = ALL_ASSETS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,17 +102,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ------------------------------------------------------------------
-# BUFFER
-# ------------------------------------------------------------------
+# ── buffer ───────────────────────────────────────────────────────────
 
 class TickBuffer:
-    """
-    Thread-safe in-memory buffer for one asset/exchange pair.
-    Flushes to parquet on rotation or max_rows.
-    Naming: {asset}_{exchange}_{YYYYMMDD}_{HHMMSS}.parquet
-    """
-
     def __init__(self, asset: str, exchange: str):
         self.asset    = asset
         self.exchange = exchange
@@ -125,11 +134,9 @@ class TickBuffer:
             return
         path = self.filename
         pd.DataFrame(self._rows).to_parquet(path, index=False)
-        log.info(
-            "FLUSH [%s/%s] %d rows -> %s (%s)",
-            self.exchange.upper(), self.asset.upper(),
-            len(self._rows), path.name, reason,
-        )
+        log.info("FLUSH [%s/%s] %d rows -> %s (%s)",
+                 self.exchange.upper(), self.asset.upper(),
+                 len(self._rows), path.name, reason)
         self._rows   = []
         self._start  = time.time()
         self._ts_str = time.strftime("%Y%m%d_%H%M%S", time.localtime())
@@ -138,9 +145,7 @@ class TickBuffer:
         return len(self._rows)
 
 
-# ------------------------------------------------------------------
-# FEED COROUTINES
-# ------------------------------------------------------------------
+# ── feeds ────────────────────────────────────────────────────────────
 
 async def feed_binance(asset: str, buf: TickBuffer) -> None:
     stream  = ASSET_CONFIG[asset]["binance_stream"]
@@ -267,15 +272,12 @@ async def feed_bitso(asset: str, buf: TickBuffer) -> None:
             backoff = min(backoff * 2, 30)
 
 
-# ------------------------------------------------------------------
-# MONITOR
-# ------------------------------------------------------------------
+# ── monitor ──────────────────────────────────────────────────────────
 
 async def monitor_loop(
     buffers: Dict[str, Dict[str, TickBuffer]],
     assets:  list[str],
 ) -> None:
-    """Log buffer sizes every 5 minutes. Confirms data is flowing."""
     while True:
         await asyncio.sleep(300)
         lines = ["--- Buffer status ---"]
@@ -289,15 +291,12 @@ async def monitor_loop(
         log.info("\n".join(lines))
 
 
-# ------------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------------
+# ── main ─────────────────────────────────────────────────────────────
 
 async def run(assets: list[str]) -> None:
     DATA_DIR.mkdir(exist_ok=True)
     Path("logs").mkdir(exist_ok=True)
 
-    # Build one buffer per asset/exchange
     buffers: Dict[str, Dict[str, TickBuffer]] = {}
     tasks   = []
 
@@ -331,7 +330,6 @@ async def run(assets: list[str]) -> None:
     log.info("Assets:   %s", ", ".join(a.upper() for a in assets))
     log.info("Rotation: every %d min", ROTATE_SEC // 60)
     log.info("Output:   %s/", DATA_DIR)
-    log.info("Naming:   {asset}_{exchange}_{YYYYMMDD}_{HHMMSS}.parquet")
     log.info("=" * 60)
 
     def _flush_all(reason: str = "shutdown") -> None:
@@ -355,9 +353,9 @@ def main() -> None:
     parser.add_argument(
         "--assets",
         nargs="+",
-        choices=["btc", "eth", "sol"],
-        default=["btc", "eth", "sol"],
-        help="Assets to record (default: btc eth sol)",
+        choices=VALID_ASSETS,
+        default=ALL_ASSETS,
+        help=f"Assets to record (default: all — {', '.join(ALL_ASSETS)})",
     )
     args = parser.parse_args()
 
