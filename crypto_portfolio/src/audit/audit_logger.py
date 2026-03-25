@@ -173,12 +173,19 @@ def handler(event: dict, context: Any) -> dict:
     }
 
 
-def _extract_stage_result(result: dict, stage: str) -> dict:
+def _extract_stage_result(result: Any, stage: str) -> dict:
     """Extract key metrics from a stage result."""
     if not result:
         return {"status": "no_data"}
 
-    # Lambda invocation result
+    # Step Functions may pass result as a JSON string - parse it
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            return {"status": "unparseable", "raw": result[:200]}
+
+    # Lambda invocation result wraps payload
     payload = result.get("Payload", result)
     if isinstance(payload, str):
         try:
@@ -186,10 +193,13 @@ def _extract_stage_result(result: dict, stage: str) -> dict:
         except Exception:
             pass
 
+    if not isinstance(payload, dict):
+        return {"status": "unknown", "raw": str(payload)[:200]}
+
     return {
-        "status":      "success" if payload.get("statusCode") == 200 else "unknown",
-        "records":     payload.get("records_written", payload.get("result_rows", -1)),
-        "duration_s":  payload.get("duration_seconds", -1),
+        "status":     "success" if payload.get("statusCode") == 200 else "unknown",
+        "records":    payload.get("records_written", payload.get("result_rows", -1)),
+        "duration_s": payload.get("duration_seconds", -1),
     }
 
 
