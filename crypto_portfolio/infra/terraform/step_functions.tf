@@ -184,13 +184,13 @@ resource "aws_sfn_state_machine" "pipeline" {
         Parameters = {
           FunctionName = aws_lambda_function.audit_logger.arn
           Payload = {
-            "status"            = "SUCCESS"
-            "execution_name"    = "$$.Execution.Name"
-            "execution_arn"     = "$$.Execution.Id"
-            "started_at"        = "$$.Execution.StartTime"
-            "ingest_result"     = "$.ingest_result"
-            "backtest_result"   = "$.backtest_result"
-            "simulation_result" = "$.simulation_result"
+            "status"              = "SUCCESS"
+            "execution_name.$"    = "$$.Execution.Name"
+            "execution_arn.$"     = "$$.Execution.Id"
+            "started_at.$"        = "$$.Execution.StartTime"
+            "ingest_result.$"     = "$.ingest_result"
+            "backtest_result.$"   = "$.backtest_result"
+            "simulation_result.$" = "$.simulation_result"
           }
         }
         ResultPath = "$.audit_result"
@@ -222,9 +222,9 @@ resource "aws_sfn_state_machine" "pipeline" {
         Parameters = {
           FunctionName = aws_lambda_function.audit_logger.arn
           Payload = {
-            "status"         = "FAILED"
-            "execution_name" = "$$.Execution.Name"
-            "error"          = "$.error"
+            "status"           = "FAILED"
+            "execution_name.$" = "$$.Execution.Name"
+            "error.$"          = "$.error"
           }
         }
         Next = "PipelineFailed"

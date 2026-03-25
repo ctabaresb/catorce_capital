@@ -150,13 +150,19 @@ resource "aws_iam_role_policy" "lambda_transform_s3" {
         Resource = "${aws_s3_bucket.data_lake.arn}/silver/*"
       },
       {
+        Sid    = "S3GoldAuditWrite"
+        Effect = "Allow"
+        Action = ["s3:PutObject", "s3:GetObject"]
+        Resource = "${aws_s3_bucket.data_lake.arn}/gold/audit/*"
+      },
+      {
         Sid      = "S3ListBucket"
         Effect   = "Allow"
         Action   = "s3:ListBucket"
         Resource = aws_s3_bucket.data_lake.arn
         Condition = {
           StringLike = {
-            "s3:prefix" = ["bronze/*", "silver/*"]
+            "s3:prefix" = ["bronze/*", "silver/*", "gold/*"]
           }
         }
       }
