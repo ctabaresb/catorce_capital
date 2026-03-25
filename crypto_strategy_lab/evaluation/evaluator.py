@@ -4,7 +4,6 @@ import pandas as pd
 
 # Per-asset spread constants (bps) — fallback when realized spread is unavailable
 # Bitso spot: wide spreads, zero taker fee
-# Hyperliquid perp: tight BBO spread, but taker fee adds 7 bps round-trip
 SPREAD_BPS = {
     "btc_usd": 4.75,
     "eth_usd": 5.00,
@@ -12,20 +11,50 @@ SPREAD_BPS = {
     "default": 5.00,
 }
 
-# Hyperliquid taker fee: 0.035% per side = 3.5 bps, round-trip = 7 bps.
-# Added on top of realized spread for any strategy with exchange="hyperliquid".
-# Minimum viable gross on HL ≈ spread (~1 bps) + 7 bps fees = ~8 bps total.
-# 2× cost rule → need ~16 bps gross for conviction (vs ~9.5 bps on Bitso).
-HL_TAKER_FEE_BPS = 7.0   # round-trip (entry + exit)
+# ── Hyperliquid fee structure (Tier 0, base rate, no referral discount) ───────
+# Source: https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees
+#
+# Tier 0 (< $5M 14d volume):
+#   Taker: 0.045% per side × 2 = 0.090% = 9.0 bps round-trip
+#   Maker: 0.015% per side × 2 = 0.030% = 3.0 bps round-trip
+#
+# Tier 2 ($25M+ 14d volume):
+#   Taker: 0.035% per side × 2 = 0.070% = 7.0 bps round-trip
+#   Maker: 0.008% per side × 2 = 0.016% = 1.6 bps round-trip
+#
+# Tier 4 ($500M+ 14d volume):
+#   Taker: 0.028% per side × 2 = 0.056% = 5.6 bps round-trip
+#   Maker: 0.000% per side × 2 = 0.000% = 0.0 bps round-trip (FREE)
+#
+# NOTE: Previous evaluator used 7 bps (Tier 2 taker). Corrected to 9 bps (Tier 0).
+# All prior HL results were evaluated with LOWER cost than reality.
 
-# HL BBO spread fallback — actual realized spread from parquet is used when available.
-# These are only the default when spread_bps_bbo_p50 column is absent.
-HL_SPREAD_FALLBACK = {
-    "btc_usd": 1.0,
-    "eth_usd": 1.5,
-    "sol_usd": 2.0,
-    "default": 2.0,
+HL_FEES = {
+    # (taker_round_trip_bps, maker_round_trip_bps)
+    "tier_0": (9.0,  3.0),   # < $5M 14d vol  — current account tier
+    "tier_1": (8.0,  2.4),   # > $5M
+    "tier_2": (7.0,  1.6),   # > $25M
+    "tier_3": (6.0,  0.8),   # > $100M
+    "tier_4": (5.6,  0.0),   # > $500M  — maker free
+    "tier_5": (5.2,  0.0),   # > $2B
+    "tier_6": (4.8,  0.0),   # > $7B
 }
+
+# Default: Tier 0 (current account)
+HL_TAKER_FEE_BPS = HL_FEES["tier_0"][0]   # 9.0 bps round-trip
+HL_MAKER_FEE_BPS = HL_FEES["tier_0"][1]   # 3.0 bps round-trip
+
+# HL BBO spread fallback (from validation: median 0.142 bps for BTC)
+HL_SPREAD_FALLBACK = {
+    "btc_usd": 0.15,
+    "eth_usd": 0.20,
+    "sol_usd": 0.30,
+    "default": 0.20,
+}
+
+# Minimum viable gross edge under each execution model (for reference in comments)
+# taker: spread(0.15) + taker(9.0) = 9.15 bps → 2× rule = 18.3 bps gross needed
+# maker: spread(0.15) + maker(3.0) = 3.15 bps → 2× rule =  6.3 bps gross needed
 
 KILL_CRITERIA = {
     "min_trades":              30,
@@ -43,6 +72,8 @@ def evaluate(
     asset: str = "btc_usd",
     exchange: str = "bitso",
     direction: str = "long",
+    execution: str = "taker",       # "taker" or "maker"
+    fee_tier: str = "tier_0",       # HL fee tier — see HL_FEES dict above
     primary_horizon: str = "H120m",
     all_horizons: list = None,
     label: str = "",
@@ -56,27 +87,28 @@ def evaluate(
     signal          : boolean Series, True = enter, aligned to df.index
     asset           : asset key for spread lookup
     exchange        : "bitso" or "hyperliquid" — controls cost model
-    direction       : "long" (default) or "short"
-                      For short, forward returns are negated before cost deduction.
-                      A short entry profits when price falls.
+    direction       : "long" or "short" — short negates forward returns
+    execution       : "taker" (default) or "maker"
+                      taker = pay fee (current default)
+                      maker = pay lower fee (limit orders, fill not guaranteed)
+    fee_tier        : HL fee tier string, e.g. "tier_0" (default, < $5M 14d vol)
+                      Only applies when exchange="hyperliquid"
     primary_horizon : which horizon drives kill/pass verdict
     label           : human-readable label for logging
-
-    Returns
-    -------
-    dict with all metrics, kill flag, and kill reason
     """
     if all_horizons is None:
         all_horizons = HORIZONS
 
-    # Cost model: HL adds taker fee on top of realized spread
+    # ── Cost model ────────────────────────────────────────────────────────────
     is_hl = (exchange == "hyperliquid")
     if is_hl:
+        taker_fee, maker_fee = HL_FEES.get(fee_tier, HL_FEES["tier_0"])
+        fee_bps    = maker_fee if execution == "maker" else taker_fee
         avg_spread = HL_SPREAD_FALLBACK.get(asset, HL_SPREAD_FALLBACK["default"])
-        avg_total_cost = avg_spread + HL_TAKER_FEE_BPS
+        avg_total_cost = avg_spread + fee_bps
     else:
-        avg_spread = SPREAD_BPS.get(asset, SPREAD_BPS["default"])
-        avg_total_cost = avg_spread
+        avg_spread     = SPREAD_BPS.get(asset, SPREAD_BPS["default"])
+        avg_total_cost = avg_spread   # Bitso: zero taker, cost = spread only
 
     horizon_col = f"fwd_ret_{primary_horizon}_bps"
     valid_col   = f"fwd_valid_{primary_horizon}"
@@ -86,6 +118,8 @@ def evaluate(
         "asset":           asset,
         "exchange":        exchange,
         "direction":       direction,
+        "execution":       execution,
+        "fee_tier":        fee_tier,
         "primary_horizon": primary_horizon,
         "avg_spread_bps":  avg_spread,
         "avg_total_cost":  avg_total_cost,
@@ -142,7 +176,7 @@ def evaluate(
         realized_spread = pd.Series(avg_spread, index=gross.index)
 
     if is_hl:
-        cost = realized_spread + HL_TAKER_FEE_BPS
+        cost = realized_spread + fee_bps
     else:
         cost = realized_spread   # full round-trip spread; zero taker on Bitso
 
@@ -206,7 +240,7 @@ def evaluate(
 
     # Spread stress test: add 0.5× avg total cost on top of already-charged cost.
     # Total deduction under stress = 1.5× avg_total_cost.
-    # On HL this is 1.5 × (spread + 7 bps) — verifies edge survives wider fills.
+    # taker: 1.5 × (spread + taker_fee)  maker: 1.5 × (spread + maker_fee)
     net_stressed = net - (avg_total_cost * 0.5)
     if float(net_stressed.mean()) <= 0:
         result["kill_reason"] = "fails 1× spread stress test"
