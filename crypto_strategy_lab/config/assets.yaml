@@ -41,10 +41,13 @@ exchanges:
       sol_usd: SOL
     assets:
       btc_usd:
-        cross_books: [eth_usd]
+        cross_books: [eth_usd, sol_usd]
         has_dom: true
       eth_usd:
-        cross_books: [btc_usd]
+        cross_books: [btc_usd, sol_usd]
+        has_dom: true
+      sol_usd:
+        cross_books: [btc_usd, eth_usd]
         has_dom: true
 # ============================================================
 # Feature build parameters (shared across exchanges)

@@ -1,6 +1,111 @@
 #!/usr/bin/env python3
 """
-live_trader.py  v4.5.19  — entry latency fix: 3 REST calls → 1 on hot path
+live_trader.py  v4.5.22  — REST-only book, diff-orders as trigger only
+
+CHANGES v4.5.21 -> v4.5.22  (eliminate book corruption permanently)
+
+  THE PROBLEM (confirmed from v4.5.21 session, March 26):
+    REST seeded 50 aggregated levels correctly. But within minutes,
+    diff-orders corrupted the book. SOL trade at 13:59 showed 10.9 bps
+    gap between local ask and actual fill. XRP showed 0.07 bps phantom
+    spread again at 14:00.
+
+    Root cause: diff-orders sends INDIVIDUAL order changes (add/remove
+    one order at a price). Our dict uses price as key with aggregated
+    size. When diff-orders removes one order at $87.850, we pop the
+    entire $87.850 level even though 494 XRP of other orders remain.
+    This is fundamentally incompatible. No amount of sequence filtering
+    or refresh frequency can fix it.
+
+  THE FIX:
+    1. REST is the SOLE source of truth for bids/asks. Polled every 5s.
+       diff-orders NEVER touches bids/asks dicts.
+    2. diff-orders used only as trigger for handle_exit/handle_entry
+       and stale guard timer reset.
+    3. REST refresh interval reduced from 30s to 5s.
+       Cost: 12 calls/min/asset = 24/min total. Limit is 60/min.
+
+  Max book staleness: 5 seconds (was: unbounded due to corruption).
+  Entry fill gap should now be < 2 bps consistently.
+
+CHANGES v4.5.20 -> v4.5.21  (periodic REST refresh + aggregate fix)
+
+  THE PROBLEM (confirmed from March 25-26, 12 trades total, 2 wins):
+    v4.5.20 seeded the REST book on every reconnect. Trade 1 had 0.1 bps
+    entry gap (accurate). But trades 2-5 had 10-20 bps gaps again.
+
+    Two causes identified:
+
+    1. aggregate=false in REST URL returned individual orders (1,126 asks),
+       not price levels (50 asks). Multiple orders at the same price
+       overwrote each other in our dict. Diff-orders (which sends level
+       aggregates) conflicted with the individual-order REST data.
+       Book integrity degraded within minutes of each seed.
+
+    2. REST book only re-seeded on WebSocket reconnect (~every 3 minutes).
+       Between reconnects, diff-orders messages are lost (301 reconnects
+       in 15h confirms unreliable channel). The book drifted 10-20 bps
+       from reality within minutes, creating phantom signals.
+
+  THE FIX:
+    1. Removed aggregate=false from REST URL. Now uses default (aggregate=true).
+       Returns ~50 price levels per side with correct aggregated amounts.
+       Matches how our bids/asks dict works with diff-orders updates.
+
+    2. Added periodic REST book refresh every 30 seconds inside bitso_feed.
+       On every incoming message, checks if 30s have passed since last
+       refresh. If so, re-fetches REST book and replaces local bids/asks.
+       Book drift is now capped at 30 seconds, not 3 minutes.
+       Cost: 1 public REST call per 30s per asset = 2/min for XRP+SOL.
+       Public rate limit is 60/min. Safe.
+
+  Expected outcome:
+    Entry fill gap (fallback vs corrected) should be < 2 bps consistently.
+    Signals fire on REAL divergences, not phantom ones.
+    Win rate should approach the research 60-62%.
+
+CHANGES v4.5.19 -> v4.5.20  (book accuracy — the REAL root cause of live losses)
+
+  THE PROBLEM (confirmed from March 25 live session, 4 trades, 0% win rate):
+    After every WebSocket reconnect, bids/asks dicts were cleared and rebuilt
+    solely from diff-orders messages. But diff-orders only sends CHANGES that
+    occur AFTER the connection. All orders already resting on the book are
+    invisible to the local book reconstruction.
+
+    Result: local book had 3-10 levels while real Bitso book had 50.
+    Local best ask was WRONG by 7-18 bps on every single trade.
+
+    Trade-by-trade evidence:
+      Trade 1: local ask $1.40921, real fill $1.41135 = 15.2 bps gap
+      Trade 2: local ask $1.41520, real fill $1.41622 =  7.2 bps gap
+      Trade 3: local ask $1.41092, real fill $1.41220 =  9.1 bps gap
+      Trade 4: local ask $1.41357, real fill $1.41615 = 18.2 bps gap
+
+    The signal computed divergence using the WRONG local mid. A true 2-3 bps
+    divergence appeared as 8-10 bps because the local Bitso mid was stale.
+    The strategy entered on PHANTOM signals. Every entry started 7-18 bps
+    underwater. Stop loss fired on 3 of 4 trades within 2 seconds.
+
+    86 stale reconnects in 4.3 hours (one every 3 minutes) meant the local
+    book was degraded most of the session.
+
+    App data confirms: all 4 entries filled at a SINGLE price (no multi-level
+    sweep). The depth was there (495 XRP at best ask). The order did not
+    sweep the book. Our local book was simply wrong about where the ask was.
+
+  THE FIX:
+    After every WebSocket reconnect, BEFORE processing any diff-orders:
+    1. Fetch full order book via GET /v3/order_book/?book={book}
+    2. Seed local bids/asks dicts from REST snapshot (50 levels each side)
+    3. Record snapshot sequence number
+    4. Discard diff-orders with sequence <= snapshot sequence
+    5. Apply subsequent diff-orders normally
+
+    This is exactly what the Bitso docs prescribe for keeping a local book.
+    The code was missing step 1-4 since v1.0.
+
+    REST fetch adds ~300-500ms to reconnect time. Acceptable: the alternative
+    is trading on a phantom book for 30-60 seconds.
 
 CHANGES v4.5.18 -> v4.5.19  (entry latency — the real root cause of live losses)
 
@@ -1151,7 +1256,7 @@ class PnLTracker:
     def summary_text(self, mode: str, runtime_hr: float) -> str:
         trades_hr = self.n_trades / max(runtime_hr, 0.01)
         return "\n".join([
-            f"Bitso Lead-Lag v4.5.19 [{mode.upper()}] {ASSET.upper()}",
+            f"Bitso Lead-Lag v4.5.22 [{mode.upper()}] {ASSET.upper()}",
             f"Runtime:      {runtime_hr:.1f}h",
             f"Trades:       {self.n_trades}  ({trades_hr:.1f}/hr)",
             f"Win rate:     {self.win_rate*100:.0f}%  ({self.n_wins}W/{self.n_trades-self.n_wins}L)",
@@ -2536,6 +2641,55 @@ async def coinbase_feed(state: MarketState):
             backoff = min(backoff * 2, 30)
 
 
+async def _fetch_rest_order_book() -> dict:
+    """
+    Fetch full order book snapshot via Bitso REST API.
+    Returns {success, bids: {price: size}, asks: {price: size}, sequence: int}.
+
+    v4.5.20: This is the critical fix for phantom signal entries.
+    After every WebSocket reconnect, the local bids/asks dicts were rebuilt
+    solely from diff-orders messages. But diff-orders only sends CHANGES
+    that occur AFTER the connection. All orders already resting on the book
+    are invisible. Result: local book has 3-10 levels while real book has 50.
+    Local mid is wrong. Signals fire on phantom divergences.
+
+    The Bitso docs prescribe: fetch REST book after subscribing to diff-orders,
+    seed local dicts from snapshot, discard diff-orders with sequence <= snapshot.
+    """
+    try:
+        path = f"/v3/order_book/?book={BITSO_BOOK}"
+        s = _get_session()
+        async with s.get(BITSO_API_URL + path) as r:
+            data = await r.json()
+        if data.get("success"):
+            payload  = data["payload"]
+            sequence = int(payload.get("sequence", 0))
+            bid_dict = {}
+            ask_dict = {}
+            for b in payload.get("bids", []):
+                px = float(b["price"])
+                sz = float(b["amount"])
+                if sz > 0:
+                    bid_dict[px] = sz
+            for a in payload.get("asks", []):
+                px = float(a["price"])
+                sz = float(a["amount"])
+                if sz > 0:
+                    ask_dict[px] = sz
+            return {
+                "success": True,
+                "bids": bid_dict,
+                "asks": ask_dict,
+                "sequence": sequence,
+                "n_bids": len(bid_dict),
+                "n_asks": len(ask_dict),
+            }
+        return {"success": False, "error": data}
+    except Exception as e:
+        log.warning("[Bitso] REST order book fetch failed: %s", e)
+        return {"success": False, "error": str(e)}
+
+
 async def bitso_feed(state: MarketState, risk: RiskState, pnl: PnLTracker):
     url     = "wss://ws.bitso.com"
     backoff = 1.0
@@ -2562,9 +2716,110 @@ async def bitso_feed(state: MarketState, risk: RiskState, pnl: PnLTracker):
                 bids.clear()
                 asks.clear()
                 state.record_reconnect()   # track reconnect for feed quality guard
-                log.info("[Bitso] Connected. Book: %s (diff-orders + trades)", BITSO_BOOK)
+
+                # ── v4.5.20 FIX: Seed local book from REST snapshot ──────
+                #
+                # CRITICAL BUG in v4.5.19 and all prior versions:
+                # After every reconnect, bids/asks dicts were cleared and rebuilt
+                # solely from diff-orders. But diff-orders only sends CHANGES
+                # after connection. All resting orders are invisible.
+                #
+                # Result: local book had 3-10 levels while real book had 50.
+                # Local mid was wrong by 7-18 bps. Signals fired on phantom
+                # divergences. Entries filled at the REAL ask (much higher),
+                # then stop loss fired instantly on the stale local mid.
+                #
+                # March 25: 4 trades, all losses at -21 bps avg, 0% win rate.
+                # All 4 entries filled 7-18 bps above the local best ask.
+                # All fills were at a SINGLE price (no market impact).
+                # Root cause: local ask was wrong, not market impact.
+                #
+                # FIX: Bitso docs prescribe fetching the REST order book after
+                # subscribing, seeding local dicts, and discarding diff-orders
+                # with sequence <= snapshot sequence. This is now implemented.
+                #
+                # The REST fetch adds ~300-500ms to reconnect time. Acceptable:
+                # the alternative is trading on a phantom book for 30-60 seconds
+                # until enough diffs arrive to approximate the real book.
+                snapshot_seq = 0
+                rest_book = await _fetch_rest_order_book()
+                if rest_book.get("success"):
+                    bids.update(rest_book["bids"])
+                    asks.update(rest_book["asks"])
+                    snapshot_seq = rest_book["sequence"]
+                    # Immediately update state with accurate top-of-book
+                    if bids and asks:
+                        bb, ba = max(bids), min(asks)
+                        if bb > 0 and ba > 0 and bb < ba:
+                            state.update_bitso_top(bb, ba)
+                    log.info(
+                        "[Bitso] REST book seeded: %d bids, %d asks, seq=%d, "
+                        "best_bid=$%.5f, best_ask=$%.5f, spread=%.2f bps",
+                        rest_book["n_bids"], rest_book["n_asks"], snapshot_seq,
+                        max(bids) if bids else 0,
+                        min(asks) if asks else 0,
+                        state.bitso_spread_bps,
+                    )
+                else:
+                    log.warning(
+                        "[Bitso] REST book fetch FAILED: %s. "
+                        "Falling back to diff-orders only (degraded accuracy).",
+                        rest_book.get("error", "unknown"),
+                    )
+
+                log.info("[Bitso] Connected. Book: %s (diff-orders + trades + REST seed)",
+                         BITSO_BOOK)
+
+                # v4.5.21: periodic REST refresh timer
+                last_rest_refresh = time.time()
+                BOOK_REFRESH_SEC  = 5.0  # re-fetch REST book every 5s
 
                 async for raw in ws:
+                    # ── v4.5.22: REST-ONLY book, polled every 5 seconds ───
+                    #
+                    # v4.5.20-21 attempted to seed the REST book on reconnect
+                    # and/or every 30s, then apply diff-orders on top.
+                    # This FAILS because diff-orders sends individual order
+                    # changes while our dict uses price-level aggregates.
+                    # When diff-orders removes ONE order at a price, we pop
+                    # the entire level (including other orders at that price).
+                    # Book corrupts within seconds of each REST seed.
+                    #
+                    # Evidence: SOL trade at 13:59:44 showed 10.9 bps gap
+                    # between local ask and actual fill, 4.5 min after seed.
+                    # XRP at 14:00:07 showed spread=0.07 bps (phantom book).
+                    #
+                    # FIX: REST is the SOLE source of truth for bids/asks.
+                    # Polled every 5 seconds. diff-orders and trades messages
+                    # are used ONLY as triggers for handle_exit/handle_entry,
+                    # NOT for updating the book. This eliminates the corruption
+                    # entirely. Max book staleness = 5 seconds.
+                    #
+                    # Cost: 12 public REST calls/min per asset = 24/min total.
+                    # Public rate limit is 60/min. Safe.
+                    now_rf = time.time()
+                    if now_rf - last_rest_refresh > BOOK_REFRESH_SEC:
+                        try:
+                            refresh = await _fetch_rest_order_book()
+                            if refresh.get("success"):
+                                bids.clear()
+                                asks.clear()
+                                bids.update(refresh["bids"])
+                                asks.update(refresh["asks"])
+                                snapshot_seq = refresh["sequence"]
+                                if bids and asks:
+                                    bb_r, ba_r = max(bids), min(asks)
+                                    if bb_r > 0 and ba_r > 0 and bb_r < ba_r:
+                                        state.update_bitso_top(bb_r, ba_r)
+                                log.debug(
+                                    "[Bitso] REST refresh: %d bids, %d asks, spread=%.2f bps",
+                                    refresh["n_bids"], refresh["n_asks"],
+                                    state.bitso_spread_bps,
+                                )
+                        except Exception as e:
+                            log.debug("[Bitso] REST refresh failed: %s", e)
+                        last_rest_refresh = time.time()
+
                     msg = json.loads(raw)
                     if not isinstance(msg, dict):
                         continue
@@ -2598,45 +2853,20 @@ async def bitso_feed(state: MarketState, risk: RiskState, pnl: PnLTracker):
                     if msg_type != "diff-orders":
                         continue
 
-                    # ── diff-orders channel ───────────────────────────────
-                    # Payload is a list of order diffs. Each entry:
-                    #   r = price, t = side (0=bid, 1=ask), a = amount
-                    #   a == 0 means order removed; a > 0 means placed/updated
-                    # Fires on every book change at any level — millisecond rate.
-                    payload = msg.get("payload", [])
-                    if not isinstance(payload, list):
-                        continue
-
-                    for row in payload:
-                        try:
-                            px   = float(row["r"])
-                            sz   = float(row.get("a", 0))
-                            side = int(row.get("t", -1))
-                            if side == 0:   # bid
-                                bids.pop(px, None) if sz == 0 else bids.__setitem__(px, sz)
-                            elif side == 1: # ask
-                                asks.pop(px, None) if sz == 0 else asks.__setitem__(px, sz)
-                        except Exception:
-                            continue
+                    # ── diff-orders channel (v4.5.22: TRIGGER ONLY) ───────
+                    # diff-orders is NO LONGER used to update bids/asks.
+                    # REST poll every 5s is the sole source of truth.
+                    #
+                    # diff-orders still serves two purposes:
+                    # 1. Trigger handle_exit (stop loss) on every message
+                    # 2. Keep the stale guard timer alive (prevents reconnect)
+                    #
+                    # The bids/asks dicts are only modified by REST refresh.
 
                     if not bids or not asks:
                         continue
 
                     # Stale guard: fires on EVERY message regardless of book state.
-                    # Must be checked here, before the crossed-book continue below,
-                    # otherwise it is unreachable when all ticks are crossed and
-                    # bitso.age() grows indefinitely (the v3.2/v3.5 failure mode).
-                    # Only activates after 15s of connection age to allow the
-                    # initial snapshot to populate.
-                    #
-                    # TWO-SPEED THRESHOLD:
-                    # When IN_POSITION: 8s max stale. A 30s blind window while
-                    # holding a position means a stop loss at -8 bps becomes -16 bps
-                    # because handle_exit cannot fire without valid ticks. Reconnect
-                    # fast to protect open positions.
-                    # When FLAT: 30s max stale. No position at risk, so we can
-                    # tolerate longer quiet periods without unnecessary reconnects
-                    # that previously caused orphan events.
                     stale_threshold = 8.0 if risk.in_position() else STALE_RECONNECT_SEC
                     if (state.bitso.age() > stale_threshold
                             and time.time() - connect_ts > 15.0):
@@ -2807,7 +3037,7 @@ async def startup_checks() -> bool:
 
 async def main():
     log.info("=" * 66)
-    log.info("Bitso Lead-Lag Trader v4.5.19  |  %s  |  %s",
+    log.info("Bitso Lead-Lag Trader v4.5.22  |  %s  |  %s",
              ASSET.upper(), EXEC_MODE.upper())
     log.info("Book: %s  Binance: %s  Coinbase: %s",
              BITSO_BOOK, BINANCE_SYMBOL, COINBASE_SYMBOL)
@@ -2832,7 +3062,7 @@ async def main():
     pnl   = PnLTracker()
 
     await tg(
-        f"Bitso Lead-Lag v4.5.19 [{EXEC_MODE.upper()}] {ASSET.upper()} started\n"
+        f"Bitso Lead-Lag v4.5.22 [{EXEC_MODE.upper()}] {ASSET.upper()} started\n"
         f"Book: {BITSO_BOOK}  Threshold: {ENTRY_THRESHOLD_BPS}-{ENTRY_MAX_BPS}bps  Window: {SIGNAL_WINDOW_SEC}s\n"
         f"Size: {MAX_POS_ASSET} {ASSET.upper()}  Limit: ${MAX_DAILY_LOSS_USD}\n"
         f"Spread: {SPREAD_MIN_BPS}-{SPREAD_MAX_BPS}bps  Force close: {FORCE_CLOSE_SLIPPAGE*100:.1f}%  Reconciler: {int(RECONCILE_SEC)}s\n"
@@ -2864,7 +3094,7 @@ async def main():
             await _http_session.close()
         log.info("Shutdown.\n%s", pnl.summary_text(EXEC_MODE, 0))
         _send_telegram_sync(
-            f"Bitso Lead-Lag v4.5.19 STOPPED [{EXEC_MODE.upper()}] {ASSET.upper()}\n"
+            f"Bitso Lead-Lag v4.5.22 STOPPED [{EXEC_MODE.upper()}] {ASSET.upper()}\n"
             + pnl.summary_text(EXEC_MODE, 0)
         )
 
