@@ -10,36 +10,31 @@ Two structural setups:
 
 1. OI Capitulation (LONG signal)
    Price falls AND OI falls simultaneously = forced liquidations.
-   Leveraged longs are being closed (margin calls, stop-outs), which
-   temporarily suppresses price. Once the liquidation cascade exhausts,
-   price tends to snap back. The signal fires when OI decline is large
-   enough to indicate genuine de-leveraging, not just normal ebb.
+   Once the liquidation cascade exhausts, price tends to snap back.
 
 2. OI Distribution (SHORT signal)
    Price rises AND OI falls simultaneously = shorts covering.
    A rising price driven by short covering (not fresh long demand) tends
-   to stall when covering is exhausted. Classic "short squeeze exhaustion."
-   OI falling while price rises = no new longs confirming the move.
+   to stall when covering is exhausted.
 
-Signal Logic (LONG — OI_Capitulation)
---------------------------------------
-Gate 1: can_trade
-Gate 2: OI declined significantly in last 4h (oi_change_4h_pct < -threshold)
-Gate 3: Price also declined (bar was a down bar or 4h negative)
-Gate 4: NOT in structural freefall — OI decline slowing (rate of change moderating)
-Gate 5: Anti-crash filter (slope not extremely negative)
-Gate 6: Tradability floor
-Gate 7: Vol not spiking (panic = don't catch falling knife)
+Cross-Asset Enhancement (OI_Distribution)
+------------------------------------------
+If ETH and/or SOL are ALSO rising simultaneously while OI is falling,
+the short squeeze is market-wide — coordinated across assets. A market-wide
+squeeze is more likely to be pure short covering rather than genuine new
+demand, making the exhaustion/reversal setup stronger.
 
-Signal Logic (SHORT — OI_Distribution)
----------------------------------------
-Gate 1: can_trade
-Gate 2: OI declined in last 4h (shorts covering)
-Gate 3: Price rose (ret_bps positive)
-Gate 4: Funding not supporting the long side (funding negative or neutral)
-Gate 5: Tradability floor
+Implementation:
+  - cross_asset_confirm_pct: fraction of available cross assets that must
+    be positive to count as "market-wide squeeze"
+    Default 0.0 = no cross-asset requirement (preserves existing behaviour)
+    Set to 0.5 = at least one of ETH/SOL must also be rising
+    Set to 1.0 = all available cross assets must be rising
+  - Cross-asset gate is OPTIONAL: if cross columns are absent (e.g. testing
+    on ETH parquet without SOL data), the gate passes silently. Never kills
+    signals due to missing data.
 
-Confidence: 40% (conceptually sound but requires clear threshold calibration)
+Confidence: 40% base, +5% with cross-asset confirmation enabled
 """
 
 import numpy as np
@@ -58,20 +53,14 @@ class OI_Capitulation(BaseStrategy):
     DIRECTION = "long"
 
     DEFAULT_PARAMS = {
-        # OI gate
-        "min_oi_decline_4h_pct":   -1.0,   # OI must fall at least 1% over 4h
-        # Price gate
-        "max_ret_bps_bar":         -3.0,   # bar return must be negative (down bar)
-        # Exhaustion check: OI decline should not be ACCELERATING
-        # (accelerating = cascade still running, don't enter)
-        "max_oi_decline_1h_pct":  -3.0,   # if 1h OI drop > 3%, cascade may still be active
-        # Anti-crash
-        "min_slope_bps":          -10.0,   # looser floor — capitulation happens in downtrends
-        "max_dist_below_ema":      -0.08,  # allow up to 8% below EMA
-        "max_vov_ratio":            4.0,   # slightly looser — volatility is expected here
-        # Execution
+        "min_oi_decline_4h_pct":   -1.0,
+        "max_ret_bps_bar":         -3.0,
+        "max_oi_decline_1h_pct":  -3.0,
+        "min_slope_bps":          -10.0,
+        "max_dist_below_ema":      -0.08,
+        "max_vov_ratio":            4.0,
         "min_tradability":          30.0,
-        "max_impact_spread_bps":    20.0,  # wider tolerance — spreads widen during selloffs
+        "max_impact_spread_bps":    20.0,
         "top_pct":                  0.40,
     }
 
@@ -84,22 +73,18 @@ class OI_Capitulation(BaseStrategy):
 
         can_trade = self._can_trade_gate(df)
 
-        # ── Gate 2: OI declined over 4h ───────────────────────────────────────
         oi_chg_4h = pd.to_numeric(
             df.get("oi_change_4h_pct_last", pd.Series(np.nan, index=df.index)),
             errors="coerce"
         )
         oi_4h_gate = oi_chg_4h <= float(p["min_oi_decline_4h_pct"])
 
-        # ── Gate 3: bar price return is negative ──────────────────────────────
-        # Use both bar ret and the oi_capitulation flag from features
         ret_bps = pd.to_numeric(
             df.get("ret_bps_15", pd.Series(np.nan, index=df.index)),
             errors="coerce"
         )
         price_down = ret_bps <= float(p["max_ret_bps_bar"])
 
-        # Also accept the precomputed flag if available
         cap_flag = pd.to_numeric(
             df.get("oi_capitulation", pd.Series(0, index=df.index)),
             errors="coerce"
@@ -107,15 +92,12 @@ class OI_Capitulation(BaseStrategy):
 
         oi_price_gate = price_down | cap_flag
 
-        # ── Gate 4: OI decline not accelerating (1h) ─────────────────────────
-        # If 1h OI decline is very fast, cascade may still be active → wait
         oi_chg_1h = pd.to_numeric(
             df.get("oi_change_bar_pct", pd.Series(0.0, index=df.index)),
             errors="coerce"
         ).fillna(0.0)
         not_cascade = oi_chg_1h >= float(p["max_oi_decline_1h_pct"])
 
-        # ── Gate 5: anti-crash filter ─────────────────────────────────────────
         slope    = pd.to_numeric(
             df.get("ema_120m_slope_bps_last", pd.Series(np.nan, index=df.index)),
             errors="coerce"
@@ -137,7 +119,6 @@ class OI_Capitulation(BaseStrategy):
         not_panic     = (vov_last / (vov_mean + 1e-12)) < float(p["max_vov_ratio"])
         anti_crash    = not_freefall & not_breakdown & not_panic
 
-        # ── Gate 6 & 7: execution quality ────────────────────────────────────
         tradability = pd.to_numeric(
             df.get("tradability_score", pd.Series(np.nan, index=df.index)),
             errors="coerce"
@@ -171,25 +152,46 @@ class OI_Capitulation(BaseStrategy):
 
 
 class OI_Distribution(BaseStrategy):
-    """Short signal: price rising + OI falling = short squeeze exhaustion."""
+    """
+    Short signal: price rising + OI falling = short squeeze exhaustion.
+
+    Cross-asset gate (optional):
+    When cross-asset data is available, checks whether the squeeze is
+    market-wide (ETH/SOL also rising). A coordinated multi-asset squeeze
+    is stronger evidence of pure short covering rather than genuine demand.
+
+    cross_asset_confirm_pct controls the fraction of available cross assets
+    that must show positive 15m returns to confirm market-wide squeeze:
+      0.0 = disabled (default — preserves original behaviour exactly)
+      0.5 = at least half of available cross assets must be up
+      1.0 = all available cross assets must be up
+    """
 
     NAME      = "oi_distribution"
     DIRECTION = "short"
 
     DEFAULT_PARAMS = {
-        # OI gate: OI falling (shorts covering) while price rises
-        "min_oi_decline_4h_pct":   -0.5,   # OI down at least 0.5% over 4h
-        # Price gate: price up
-        "min_ret_bps_bar":          3.0,   # bar must be a positive bar
-        # Funding gate: funding neutral or negative (not supporting longs)
-        "max_funding_8h":           0.0002, # funding must not be extremely positive
-        # Anti-blowoff (don't short into actual breakout with momentum)
-        "max_slope_bps":            15.0,  # EMA slope ceiling (very strong up = don't short)
-        "max_dist_above_ema":        0.05, # not too far above EMA
-        "max_vov_ratio":             3.0,
-        "min_tradability":           35.0,
-        "max_impact_spread_bps":    15.0,
-        "top_pct":                   0.35,
+        "min_oi_decline_4h_pct":    -0.5,
+        "min_ret_bps_bar":           3.0,
+        "max_funding_8h":            0.0002,
+        "max_slope_bps":             15.0,
+        "max_dist_above_ema":         0.05,
+        "max_vov_ratio":              3.0,
+        "min_tradability":            35.0,
+        "max_impact_spread_bps":     15.0,
+        "top_pct":                    0.35,
+        # ── Cross-asset confirmation (new) ────────────────────────────────────
+        # Fraction of available cross assets that must also be rising (>min_cross_ret_bps)
+        # to confirm the squeeze is market-wide.
+        # 0.0 = disabled (original behaviour — no cross-asset requirement)
+        # 0.5 = at least one of ETH/SOL must be rising (if data available)
+        # 1.0 = all available cross assets must be rising
+        "cross_asset_confirm_pct":   0.0,
+        # Minimum cross-asset 15m return to count as "also rising"
+        "min_cross_ret_bps":         2.0,
+        # Cross assets to check (subset of what's available in parquet)
+        # Missing columns are silently skipped — never kills signals due to absent data
+        "cross_assets":             ["eth_usd", "sol_usd"],
     }
 
     def __init__(self, params: dict = None):
@@ -208,13 +210,12 @@ class OI_Distribution(BaseStrategy):
         )
         oi_4h_gate = oi_chg_4h <= float(p["min_oi_decline_4h_pct"])
 
-        # Also check precomputed distribution flag
         dist_flag = pd.to_numeric(
             df.get("oi_distribution", pd.Series(0, index=df.index)),
             errors="coerce"
         ).fillna(0).astype(bool)
 
-        # ── Price up (bar positive) ───────────────────────────────────────────
+        # ── Price up ─────────────────────────────────────────────────────────
         ret_bps = pd.to_numeric(
             df.get("ret_bps_15", pd.Series(np.nan, index=df.index)),
             errors="coerce"
@@ -223,16 +224,40 @@ class OI_Distribution(BaseStrategy):
 
         oi_price_gate = (oi_4h_gate & price_up) | dist_flag
 
-        # ── Funding check: funding not strongly positive (not real bull run) ──
+        # ── Cross-asset confirmation (optional) ───────────────────────────────
+        # If cross_asset_confirm_pct > 0, check that enough cross assets are
+        # also rising — confirming the squeeze is market-wide.
+        # Silently passes when cross columns are absent in the parquet.
+        confirm_pct = float(p.get("cross_asset_confirm_pct", 0.0))
+        if confirm_pct > 0.0:
+            cross_assets  = p.get("cross_assets", ["eth_usd", "sol_usd"])
+            min_cross_ret = float(p.get("min_cross_ret_bps", 2.0))
+            available = []
+            for asset in cross_assets:
+                col = f"{asset}_ret_15m_bps_last"
+                if col in df.columns:
+                    available.append(
+                        pd.to_numeric(df[col], errors="coerce") >= min_cross_ret
+                    )
+            if len(available) == 0:
+                # No cross data available — pass silently
+                cross_gate = pd.Series(True, index=df.index)
+            else:
+                # Count how many cross assets are rising; require >= confirm_pct fraction
+                n_required   = max(1, int(np.ceil(confirm_pct * len(available))))
+                rising_count = sum(a.fillna(False).astype(int) for a in available)
+                cross_gate   = rising_count >= n_required
+        else:
+            cross_gate = pd.Series(True, index=df.index)
+
+        # ── Funding check ─────────────────────────────────────────────────────
         funding_abs = pd.to_numeric(
             df.get("funding_rate_8h_last", pd.Series(np.nan, index=df.index)),
             errors="coerce"
         )
-        # If funding is known and strongly positive, longs are paying up = real demand
-        # → don't short into genuine bull momentum
         funding_ok = funding_abs.isna() | (funding_abs <= float(p["max_funding_8h"]))
 
-        # ── Anti-blowoff: not shorting into true breakout ────────────────────
+        # ── Anti-blowoff ──────────────────────────────────────────────────────
         slope    = pd.to_numeric(
             df.get("ema_120m_slope_bps_last", pd.Series(np.nan, index=df.index)),
             errors="coerce"
@@ -276,6 +301,7 @@ class OI_Distribution(BaseStrategy):
         signal = (
             can_trade &
             oi_price_gate &
+            cross_gate &
             funding_ok &
             anti_blowoff &
             tradable_enough &
