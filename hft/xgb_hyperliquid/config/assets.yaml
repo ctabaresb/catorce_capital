@@ -1,0 +1,40 @@
+# ============================================================
+# assets.yaml — Config for build_features.py (Hyperliquid)
+# ============================================================
+# Wraps hl_pipeline.yaml settings in the format build_features.py expects.
+# Only used by build_features.py (Step 2). All other HL scripts use hl_pipeline.yaml.
+# ============================================================
+
+exchanges:
+  hyperliquid:
+    assets:
+      btc_usd:
+        cross_books: [eth_usd, sol_usd]
+      eth_usd:
+        cross_books: [btc_usd, sol_usd]
+      sol_usd:
+        cross_books: [btc_usd, eth_usd]
+
+feature_build:
+  dom:
+    k: 10
+    k_small: 3
+  windows_days:
+    - 180
+  decision_bars:
+    - timeframe: 5m
+      bar_minutes: 5
+      forward_horizons:
+        - label: H60m
+          bars: 12
+    - timeframe: 15m
+      bar_minutes: 15
+      forward_horizons:
+        - label: H60m
+          bars: 4
+        - label: H120m
+          bars: 8
+
+output:
+  raw_dir: data/artifacts_raw
+  features_dir: data/artifacts_features
