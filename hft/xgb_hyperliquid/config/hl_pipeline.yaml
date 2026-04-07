@@ -1,0 +1,107 @@
+# ============================================================
+# Hyperliquid XGB Pipeline Configuration
+# ============================================================
+# Perpetual futures on Hyperliquid: long AND short
+# Cost model: fee-dominated (spread ~0.14 bps, fees ~3 bps RT maker)
+# Data: S3 DOM + indicators (funding, OI, premium) + lead-lag (Binance/Coinbase)
+# ============================================================
+
+s3:
+  bucket: hyperliquid-orderbook
+  dom_prefix: hyperliquid_dom_parquet/
+  indicators_prefix: hyperliquid_metrics_parquet/
+  book_map:
+    btc_usd: BTC
+    eth_usd: ETH
+    sol_usd: SOL
+
+assets:
+  btc_usd:
+    cross_books: [eth_usd, sol_usd]
+  eth_usd:
+    cross_books: [btc_usd, sol_usd]
+  sol_usd:
+    cross_books: [btc_usd, eth_usd]
+
+# ── Cost model ────────────────────────────────────────────────
+# Hyperliquid fee tiers (Tier 0, <$5M 14d volume):
+#   Maker: 0.015% per side = 1.5 bps/side = 3.0 bps round-trip
+#   Taker: 0.045% per side = 4.5 bps/side = 9.0 bps round-trip
+# BTC spread: ~0.14 bps (negligible vs fees)
+# Total cost: maker=3.14 bps, taker=9.14 bps
+cost:
+  maker_rt_bps: 3.0       # round-trip maker fee in bps
+  taker_rt_bps: 9.0       # round-trip taker fee in bps
+  default_cost_bps: 3.0   # use maker as default
+  spread_bps: 0.14        # typical BTC spread (negligible)
+
+# ── Feature build ─────────────────────────────────────────────
+feature_build:
+  dom:
+    k: 10                  # top-k levels for full depth features
+    k_small: 3             # top-k near-touch levels
+  windows_days:
+    - 180                  # primary window
+    - 60                   # recency check
+  decision_bars:
+    - timeframe: 5m
+      bar_minutes: 5
+      forward_horizons:
+        - label: H60m
+          bars: 12
+    - timeframe: 15m
+      bar_minutes: 15
+      forward_horizons:
+        - label: H60m
+          bars: 4
+        - label: H120m
+          bars: 8
+
+  # Rolling windows for computed features
+  rolling_windows_m: [1, 2, 3, 5, 10, 30, 60, 120]
+
+  # MFE horizons (minutes)
+  mfe_horizons_m: [1, 2, 5, 10]
+
+  # MFE take-profit levels (bps above cost)
+  tp_levels_bps: [0, 2, 5]
+
+# ── Lead-lag sources ──────────────────────────────────────────
+leadlag:
+  binance:
+    base_url: "https://api.binance.com"
+    symbols:
+      btc_usd: BTCUSDT
+      eth_usd: ETHUSDT
+      sol_usd: SOLUSDT
+    interval: 1m
+  coinbase:
+    base_url: "https://api.exchange.coinbase.com"
+    symbols:
+      btc_usd: BTC-USD
+      eth_usd: ETH-USD
+      sol_usd: SOL-USD
+    interval: 60   # granularity in seconds
+
+# ── Training ──────────────────────────────────────────────────
+training:
+  walk_forward:
+    train_days: 90
+    val_days: 7
+    step_days: 7
+  static_split:
+    train_pct: 0.70
+    val_pct: 0.15
+    test_pct: 0.15
+  spread_gate_pctile: 40
+  top_pct: 0.05            # precision@top_5%
+  max_evals: 30             # Hyperopt evals per fold
+  directions: [long, short] # bidirectional
+
+# ── Output ────────────────────────────────────────────────────
+output:
+  raw_dir: data/artifacts_raw
+  indicators_dir: data/artifacts_raw
+  leadlag_dir: data/leadlag_klines
+  features_dir: data/artifacts_features
+  xgb_dir: data/artifacts_xgb
