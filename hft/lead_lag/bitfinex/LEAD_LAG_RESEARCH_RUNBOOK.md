@@ -57,18 +57,18 @@ echo "Lead-Lag Research: Downloading Data"
 echo "============================================"
 
 # Clean slate — avoid mixing old and new data
-rm -rf ~/bitfinex_research/bitfinex_book_data
-mkdir -p ~/bitfinex_research/bitfinex_book_data
-mkdir -p ~/bitfinex_research/leader_data
+rm -rf ./bitfinex_research/bitfinex_book_data
+mkdir -p ./bitfinex_research/bitfinex_book_data
+mkdir -p ./bitfinex_research/leader_data
 
 echo ""
 echo ">>> Downloading Bitfinex book-channel data..."
-aws s3 sync s3://bitfinex-orderbook/data/ ~/bitfinex_research/bitfinex_book_data/ \
+aws s3 sync s3://bitfinex-orderbook/data/ ./bitfinex_research/bitfinex_book_data/ \
   --exclude "*" --include "*_bitfinex_book_*"
 
 echo ""
 echo ">>> Downloading leader data (BinanceUS + Coinbase)..."
-aws s3 sync s3://bitso-orderbook/data/lead_lag/ ~/bitfinex_research/leader_data/ \
+aws s3 sync s3://bitso-orderbook/data/lead_lag/ ./bitfinex_research/leader_data/ \
   --exclude "*" \
   --include "btc_binance_*" --include "btc_coinbase_*" \
   --include "eth_binance_*" --include "eth_coinbase_*" \
@@ -86,18 +86,18 @@ echo "Total: $(ls ~/bitfinex_research/bitfinex_book_data/ | wc -l | tr -d ' ') f
 
 echo ""
 echo "=== PER ASSET ==="
-echo "BTC: $(ls ~/bitfinex_research/bitfinex_book_data/btc_bitfinex_book_* 2>/dev/null | wc -l | tr -d ' ') files"
-echo "ETH: $(ls ~/bitfinex_research/bitfinex_book_data/eth_bitfinex_book_* 2>/dev/null | wc -l | tr -d ' ') files"
-echo "SOL: $(ls ~/bitfinex_research/bitfinex_book_data/sol_bitfinex_book_* 2>/dev/null | wc -l | tr -d ' ') files"
-echo "XRP: $(ls ~/bitfinex_research/bitfinex_book_data/xrp_bitfinex_book_* 2>/dev/null | wc -l | tr -d ' ') files"
+echo "BTC: $(ls ./bitfinex_research/bitfinex_book_data/btc_bitfinex_book_* 2>/dev/null | wc -l | tr -d ' ') files"
+echo "ETH: $(ls ./bitfinex_research/bitfinex_book_data/eth_bitfinex_book_* 2>/dev/null | wc -l | tr -d ' ') files"
+echo "SOL: $(ls ./bitfinex_research/bitfinex_book_data/sol_bitfinex_book_* 2>/dev/null | wc -l | tr -d ' ') files"
+echo "XRP: $(ls ./bitfinex_research/bitfinex_book_data/xrp_bitfinex_book_* 2>/dev/null | wc -l | tr -d ' ') files"
 
 echo ""
 echo "=== LEADERS ==="
-echo "BTC Binance:  $(ls ~/bitfinex_research/leader_data/btc_binance_* 2>/dev/null | wc -l | tr -d ' ') files"
-echo "BTC Coinbase: $(ls ~/bitfinex_research/leader_data/btc_coinbase_* 2>/dev/null | wc -l | tr -d ' ') files"
-echo "ETH Binance:  $(ls ~/bitfinex_research/leader_data/eth_binance_* 2>/dev/null | wc -l | tr -d ' ') files"
-echo "SOL Binance:  $(ls ~/bitfinex_research/leader_data/sol_binance_* 2>/dev/null | wc -l | tr -d ' ') files"
-echo "XRP Binance:  $(ls ~/bitfinex_research/leader_data/xrp_binance_* 2>/dev/null | wc -l | tr -d ' ') files"
+echo "BTC Binance:  $(ls ./bitfinex_research/leader_data/btc_binance_* 2>/dev/null | wc -l | tr -d ' ') files"
+echo "BTC Coinbase: $(ls ./bitfinex_research/leader_data/btc_coinbase_* 2>/dev/null | wc -l | tr -d ' ') files"
+echo "ETH Binance:  $(ls ./bitfinex_research/leader_data/eth_binance_* 2>/dev/null | wc -l | tr -d ' ') files"
+echo "SOL Binance:  $(ls ./bitfinex_research/leader_data/sol_binance_* 2>/dev/null | wc -l | tr -d ' ') files"
+echo "XRP Binance:  $(ls ./bitfinex_research/leader_data/xrp_binance_* 2>/dev/null | wc -l | tr -d ' ') files"
 
 echo ""
 echo ">>> IMPORTANT: Each asset needs 50+ files for meaningful research."
@@ -110,7 +110,7 @@ echo "Download complete. Proceed to Step 2."
 
 ## Step 2: Run Research
 
-Run from the `~/bitfinex_research` directory. The script `master_leadlag_bitfinex.py` must be in that directory.
+Run from the `./bitfinex_research` directory. The script `master_leadlag_bitfinex.py` must be in that directory.
 
 ```bash
 #!/bin/bash
@@ -119,10 +119,10 @@ Run from the `~/bitfinex_research` directory. The script `master_leadlag_bitfine
 
 set -e
 
-cd ~/bitfinex_research
+cd ./bitfinex_research
 
-LEADER_DIR=~/bitfinex_research/leader_data
-FOLLOWER_DIR=~/bitfinex_research/bitfinex_book_data
+LEADER_DIR=./bitfinex_research/leader_data
+FOLLOWER_DIR=./bitfinex_research/bitfinex_book_data
 POS_USD=292
 
 echo "============================================"
