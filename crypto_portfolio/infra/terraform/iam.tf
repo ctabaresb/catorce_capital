@@ -216,9 +216,15 @@ resource "aws_iam_role_policy" "ecs_task_s3" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "SilverRead"
+        Sid    = "BronzeRead"
         Effect = "Allow"
         Action = ["s3:GetObject", "s3:HeadObject"]
+        Resource = "${aws_s3_bucket.data_lake.arn}/bronze/*"
+      },
+      {
+        Sid    = "SilverReadWrite"
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:HeadObject", "s3:PutObject", "s3:DeleteObject"]
         Resource = "${aws_s3_bucket.data_lake.arn}/silver/*"
       },
       {
@@ -234,7 +240,7 @@ resource "aws_iam_role_policy" "ecs_task_s3" {
         Resource = aws_s3_bucket.data_lake.arn
         Condition = {
           StringLike = {
-            "s3:prefix" = ["silver/*", "gold/*"]
+            "s3:prefix" = ["bronze/*", "silver/*", "gold/*"]
           }
         }
       }
@@ -280,19 +286,26 @@ resource "aws_iam_role_policy_attachment" "ecs_execution_managed" {
 }
 
 # ---------------------------------------------------------------------------
-# 5. EventBridge Role - allows EventBridge to invoke the ingest Lambda
+# 5. EventBridge Role - invoke Lambda, start Step Functions, run ECS tasks
 # ---------------------------------------------------------------------------
 resource "aws_iam_role" "eventbridge_invoke" {
   name        = "${var.project_name}-${var.environment}-eventbridge-invoke"
-  description = "Allows EventBridge scheduler to invoke the ingest Lambda."
+  description = "Allows EventBridge to invoke Lambda, start Step Functions, and run ECS tasks."
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "scheduler.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "scheduler.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      },
+      {
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      }
+    ]
   })
 }
 
@@ -307,6 +320,43 @@ resource "aws_iam_role_policy" "eventbridge_invoke_lambda" {
       Action   = "lambda:InvokeFunction"
       Resource = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-${var.environment}-ingest-eod"
     }]
+  })
+}
+
+resource "aws_iam_role_policy" "eventbridge_invoke_sfn" {
+  name = "invoke-step-functions-and-ecs"
+  role = aws_iam_role.eventbridge_invoke.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "StartStepFunctions"
+        Effect   = "Allow"
+        Action   = ["states:StartExecution"]
+        Resource = aws_sfn_state_machine.pipeline.arn
+      },
+      {
+        Sid    = "RunECSTransform"
+        Effect = "Allow"
+        Action = ["ecs:RunTask"]
+        Resource = "*"
+        Condition = {
+          ArnLike = {
+            "ecs:cluster" = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:cluster/${var.project_name}-${var.environment}"
+          }
+        }
+      },
+      {
+        Sid    = "PassRoleToECS"
+        Effect = "Allow"
+        Action = "iam:PassRole"
+        Resource = [
+          aws_iam_role.ecs_task.arn,
+          aws_iam_role.ecs_execution.arn
+        ]
+      }
+    ]
   })
 }
 
