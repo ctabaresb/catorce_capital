@@ -71,3 +71,14 @@ terraform.tfvars
 
 # Terraform cache
 .terraform/
+# Crypto portfolio - Terraform state (contains AWS secrets)
+crypto_portfolio/infra/terraform/.terraform/
+crypto_portfolio/infra/terraform/*.tfstate
+crypto_portfolio/infra/terraform/*.tfstate.backup
+crypto_portfolio/infra/terraform/terraform.tfvars
+crypto_portfolio/infra/terraform/.build/
+
+# Crypto portfolio - build artifacts
+crypto_portfolio/.build/
+crypto_portfolio/*.zip
+crypto_portfolio/.venv/

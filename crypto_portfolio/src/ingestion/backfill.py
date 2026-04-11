@@ -198,11 +198,7 @@ class HistoricalBackfill:
         # ----------------------------------------------------------------
         logger.info("Phase 2: Building daily prices panel")
 
-        df_prices = self._build_prices_panel(
-            coin_ids=list(fetch_results.keys()),
-            start_date=start_date,
-            end_date=end_date,
-        )
+        df_prices = self._build_prices_panel_from_results(fetch_results)
 
         if df_prices.empty:
             logger.error("No price data assembled. Aborting.")
@@ -431,6 +427,38 @@ class HistoricalBackfill:
     # -------------------------------------------------------------------------
     # Phase 2: Build prices panel
     # -------------------------------------------------------------------------
+
+
+    def _build_prices_panel_from_results(self, fetch_results: dict) -> pd.DataFrame:
+        """
+        Build daily prices panel directly from in-memory fetch_results.
+        Avoids S3 re-read path mismatch entirely.
+        fetch_results[coin_id] = {prices: [[ts_ms, val],...], market_caps: [...], volumes: [...]}
+        """
+        frames = []
+        for coin_id, result in fetch_results.items():
+            prices   = result.get("prices", [])
+            mkt_caps = result.get("market_caps", [])
+            volumes  = result.get("volumes", [])
+            if not prices:
+                continue
+            df = pd.DataFrame(prices, columns=["ts_ms", "close_price"])
+            df["date_day"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True).dt.date
+            if mkt_caps:
+                df_mc = pd.DataFrame(mkt_caps, columns=["ts_ms", "market_cap"])
+                df_mc["date_day"] = pd.to_datetime(df_mc["ts_ms"], unit="ms", utc=True).dt.date
+                df = df.merge(df_mc[["date_day", "market_cap"]], on="date_day", how="left")
+            if volumes:
+                df_vol = pd.DataFrame(volumes, columns=["ts_ms", "volume_24h"])
+                df_vol["date_day"] = pd.to_datetime(df_vol["ts_ms"], unit="ms", utc=True).dt.date
+                df = df.merge(df_vol[["date_day", "volume_24h"]], on="date_day", how="left")
+            df["coin_id"] = coin_id
+            df = df.drop(columns=["ts_ms"])
+            df = df.drop_duplicates(subset=["coin_id", "date_day"], keep="last")
+            frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
 
     def _build_prices_panel(
         self,

@@ -38,13 +38,16 @@ logger = logging.getLogger(__name__)
 
 
 def _load_silver(bucket: str, prefix: str, s3) -> pd.DataFrame:
-    """Load all Parquet files under a Silver prefix into one DataFrame."""
-    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
-    dfs  = []
-    for obj in resp.get("Contents", []):
-        if obj["Key"].endswith(".parquet"):
-            raw = s3.get_object(Bucket=bucket, Key=obj["Key"])
-            dfs.append(pq.read_table(io.BytesIO(raw["Body"].read())).to_pandas())
+    """Load all Parquet files under a Silver prefix into one DataFrame.
+    Uses paginator to handle >1000 partitions and recurses into date subdirs."""
+    paginator = s3.get_paginator("list_objects_v2")
+    dfs = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".parquet"):
+                raw = s3.get_object(Bucket=bucket, Key=obj["Key"])
+                dfs.append(pq.read_table(io.BytesIO(raw["Body"].read())).to_pandas())
+    logger.info("Loaded %d partitions from %s", len(dfs), prefix)
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
