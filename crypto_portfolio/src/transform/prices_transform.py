@@ -30,6 +30,12 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
+# Universe is imported here so the transform is always the source of truth
+# for in_conservative / in_balanced / in_aggressive flags.
+# The Lambda writes flags to Bronze too, but we ignore those and re-apply
+# from the canonical universe.py on every transform run.
+from ingestion.universe import UNIVERSE
+
 
 # ---------------------------------------------------------------------------
 # Silver prices schema
@@ -203,17 +209,28 @@ class PricesTransformer:
         if not records:
             return pd.DataFrame(columns=list(FIELD_MAP.values()) + ["date_day", "ingestion_ts"])
 
+        # Strip universe flags from Bronze - we re-apply from universe.py below
+        # so that changing universe.py is immediately reflected in Silver
+        # without needing to re-ingest Bronze.
+        BRONZE_ONLY_FIELDS = {"in_conservative", "in_balanced", "in_aggressive",
+                               "category", "risk_tier"}
+
         rows = []
         for record in records:
             row = {}
 
-            # Map CoinGecko fields to Silver schema fields
+            # Map CoinGecko fields to Silver schema fields (skip universe flags)
             for cg_field, silver_field in FIELD_MAP.items():
+                if silver_field in BRONZE_ONLY_FIELDS:
+                    continue
                 row[silver_field] = record.get(cg_field)
 
             # Add partition and metadata columns
             row["date_day"]     = date
             row["ingestion_ts"] = ingestion_ts
+            # Preserve CoinGecko ID for universe enrichment
+            if "id" not in row:
+                row["id"] = record.get("id", row.get("coin_id", ""))
 
             # Collect any data flags set by validator
             flags = []
@@ -227,6 +244,10 @@ class PricesTransformer:
             row["data_flags"] = ",".join(flags) if flags else None
 
             rows.append(row)
+
+        # Re-apply universe classification from canonical universe.py
+        # This overwrites any stale flags that may have been in Bronze
+        rows = UNIVERSE.enrich_records(rows)
 
         df = pd.DataFrame(rows)
 
