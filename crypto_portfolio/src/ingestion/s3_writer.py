@@ -64,6 +64,7 @@ class S3Writer:
         self.bucket = bucket
         self.region = region
         self._client = boto3.client("s3", region_name=region)
+        self._s3 = self._client
 
     # -------------------------------------------------------------------------
     # Public write methods

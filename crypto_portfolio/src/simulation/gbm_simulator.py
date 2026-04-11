@@ -106,6 +106,10 @@ class CorrelationEngine:
 
     def __init__(self, min_periods: int = 30) -> None:
         self.min_periods = min_periods
+        # Coverage threshold: 0.5 = coin must have data for at least 50% of dates.
+        # 80% was too strict for 1-year Silver history - only BTC/ETH passed.
+        # 50% on 393 days = 196 observations, sufficient for stable Cholesky.
+        self.coverage_threshold = 0.5
 
     def fit(
         self,
@@ -138,7 +142,7 @@ class CorrelationEngine:
         # Drop coins with too few observations
         pivot = pivot.dropna(
             axis=1,
-            thresh=max(self.min_periods, int(len(pivot) * 0.8)),
+            thresh=max(self.min_periods, int(len(pivot) * self.coverage_threshold)),
         )
         self.coin_ids_ = pivot.columns.tolist()
 
