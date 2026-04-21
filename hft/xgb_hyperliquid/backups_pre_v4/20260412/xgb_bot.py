@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """
-xgb_bot.py — Live XGB Trading Bot for Hyperliquid (V6 Multi-Asset)
+xgb_bot.py — Live XGB Trading Bot for Hyperliquid (V3 Multi-Asset)
 
-Runs 9 models across BTC, ETH, SOL:
-  BTC: long_1m_tp0 (0.82), short_1m_tp0 (0.86), short_2m_tp0 (0.82), short_5m_tp0 (0.82)
-  ETH: short_1m_tp0 (0.82), short_2m_tp0 (0.80)
-  SOL: long_1m_tp2 (0.76), short_1m_tp0 (0.80), short_2m_tp0 (0.78)
-
-v6 changes vs v5:
-  - Trained on Mar 5 → Apr 12 (38 days, includes uptrend + downtrend)
-  - Holdout on Apr 16-18 (the regime that killed v5 — all 9 configs profitable)
-  - Reserve confirmed on Apr 19-20 (all 9 configs positive)
-  - Direction: 2L/7S (short-biased, tested in bearish conditions)
-  - All thresholds 0.76-0.86 (shorts can actually fire now)
-  - Tick features computed from REST trade data (not median-imputed)
+Runs 8 models across BTC, ETH, SOL:
+  BTC: short_5m_tp0 (0.82), short_2m_tp2 (0.86), long_5m_tp2 (0.84)
+  ETH: short_2m_tp2 (0.86), short_5m_tp5 (0.84)
+  SOL: short_1m_tp2 (0.88), short_2m_tp2 (0.82), long_1m_tp0 (0.86)
 
 Architecture:
   Every 60s: fetch HL + Binance + Coinbase data per coin
-  → compute features → predict with 9 XGB ensembles
+  → compute features → predict with 8 XGB ensembles
   → if prediction > threshold → execute on HL
 
 Shadow mode (default): predicts and logs but does NOT place orders.
@@ -149,14 +141,6 @@ class HLClient:
 
         self.exchange = Exchange(account, base_url=base_url,
                                  account_address=acct_addr)
-
-        # Force timeout on HL SDK sessions (prevents CLOSE_WAIT hangs)
-        for _sess in (self.info.session, self.exchange.session):
-            _orig_request = _sess.request
-            def _timed_request(method, url, *a, _o=_orig_request, **kw):
-                kw.setdefault("timeout", 15)
-                return _o(method, url, *a, **kw)
-            _sess.request = _timed_request
 
         # Load meta
         result = self.info.meta_and_asset_ctxs()
@@ -444,8 +428,6 @@ class XGBBot:
         self.halted = False
         self.halt_reason = ""
         self.cooldowns: Dict[str, float] = {}  # model_name -> last_trade_time
-        self._tick_n = 0
-        self._last_probs: Dict[str, float] = {}
 
         self.hl_client: Optional[HLClient] = None
 
@@ -510,24 +492,6 @@ class XGBBot:
     def _tick(self):
         """One iteration of the main loop."""
         now = time.time()
-        self._tick_n += 1
-
-        # Heartbeat: one line per tick so silent-but-healthy is impossible
-        try:
-            ingested = {c: e._minutes_ingested for c, e in self.engines.items()}
-            warm = {c: e.is_warm() for c, e in self.engines.items()}
-            active_n = len([p for p in self.positions if p.state != "closed"])
-            if self._last_probs:
-                probs_str = " ".join(f"{n}={p:.2f}" for n, p in self._last_probs.items())
-            else:
-                probs_str = "warming"
-            logger.info(
-                f"tick={self._tick_n} ingested={ingested} warm={warm} "
-                f"positions={active_n} pnl=${self.cumulative_pnl:.2f} "
-                f"probs[{probs_str}]"
-            )
-        except Exception as _hb_e:
-            logger.warning(f"heartbeat log failed: {_hb_e}")
 
         if self.halted:
             return
@@ -557,24 +521,25 @@ class XGBBot:
                         logger.warning(f"No Binance data for {coin}, skipping")
                         continue
 
-                    from types import SimpleNamespace
-                    all_snaps[coin] = SimpleNamespace(
-                        timestamp_ms=int(time.time() * 1000),
-                        coin=coin,
-                        mid_price=bn["mid"],
-                        mark_price=bn["close"],
-                        best_bid=bn["close"] * 0.9999,
-                        best_ask=bn["close"] * 1.0001,
-                        spread_bps=0.2,
-                        open_interest=0,
-                        funding_rate_8h=0,
-                        premium=0,
-                        day_volume_usd=0,
-                        bid_depths=[(bn["close"]*0.9999, 1.0)],
-                        ask_depths=[(bn["close"]*1.0001, 1.0)],
-                        impact_bid_px=None,
-                        impact_ask_px=None,
-                    )
+                    @dataclass
+                    class FakeSnap:
+                        timestamp_ms: int = int(time.time() * 1000)
+                        coin: str = coin
+                        mid_price: float = bn["mid"]
+                        mark_price: float = bn["close"]
+                        best_bid: float = bn["close"] * 0.9999
+                        best_ask: float = bn["close"] * 1.0001
+                        spread_bps: float = 0.2
+                        open_interest: float = 0
+                        funding_rate_8h: float = 0
+                        premium: float = 0
+                        day_volume_usd: float = 0
+                        bid_depths: list = field(default_factory=lambda: [(bn["close"]*0.9999, 1.0)])
+                        ask_depths: list = field(default_factory=lambda: [(bn["close"]*1.0001, 1.0)])
+                        impact_bid_px: float = None
+                        impact_ask_px: float = None
+
+                    all_snaps[coin] = FakeSnap()
                     all_mids[coin] = bn["mid"]
 
                 # Fill in mids for reference coins not actively traded
@@ -642,8 +607,9 @@ class XGBBot:
             features = engine.compute_features(mc.feature_names)
             prob = mc.predict(features)
 
-            # Record latest prob for heartbeat visibility
-            self._last_probs[mc.name] = prob
+            # Log prediction
+            if engine._minutes_ingested % 5 == 0:
+                logger.debug(f"{mc.name}: prob={prob:.4f} (thr={mc.threshold})")
 
             # Signal fires
             if prob >= mc.threshold:
@@ -735,8 +701,7 @@ class XGBBot:
             gross_bps = (pos.entry_px / (current_mid + 1e-12) - 1) * 1e4
 
         # Cost: taker entry (4.05 bps) + maker exit (1.35 bps) = 5.4 bps
-        # Cost: taker entry (3.24 bps) + maker exit (1.35 bps) = 4.59 bps
-        cost_bps = 4.59
+        cost_bps = 5.4
         net_bps = gross_bps - cost_bps
         pnl_usd = net_bps / 1e4 * self.size_usd
 
@@ -838,7 +803,7 @@ def main():
                       help="Live mode: real orders on Hyperliquid")
     ap.add_argument("--size", type=float, default=100,
                     help="Position size in USD per trade (default $100)")
-    ap.add_argument("--models_dir", default="models/live_v6",
+    ap.add_argument("--models_dir", default="models/live_v3",
                     help="Directory containing model subdirectories")
     ap.add_argument("--max_loss", type=float, default=50,
                     help="Max cumulative loss before halt (USD)")
@@ -859,56 +824,50 @@ def main():
 
     shadow = not args.live
 
-    # Define model configs (V6: holdout-validated on Apr 16-18 bearish regime)
-    # 9 models: 2L/7S, all reserve-confirmed, thresholds 0.76-0.86.
+    # Define model configs (V3: multi-asset, 8 models across BTC/ETH/SOL)
     model_configs = [
-        # BTC models (4): 1 long + 3 short
-        ModelConfig(
-            name="btc_long_1m_tp0",
-            direction="long", horizon_m=1, threshold=0.82, coin="BTC",
-            model_dir=os.path.join(args.models_dir, "btc", "long_1m_tp0"),
-        ),
-        ModelConfig(
-            name="btc_short_1m_tp0",
-            direction="short", horizon_m=1, threshold=0.86, coin="BTC",
-            model_dir=os.path.join(args.models_dir, "btc", "short_1m_tp0"),
-        ),
-        ModelConfig(
-            name="btc_short_2m_tp0",
-            direction="short", horizon_m=2, threshold=0.82, coin="BTC",
-            model_dir=os.path.join(args.models_dir, "btc", "short_2m_tp0"),
-        ),
+        # BTC models (3)
         ModelConfig(
             name="btc_short_5m_tp0",
             direction="short", horizon_m=5, threshold=0.82, coin="BTC",
             model_dir=os.path.join(args.models_dir, "btc", "short_5m_tp0"),
         ),
-        # ETH models (2): 0 long + 2 short
         ModelConfig(
-            name="eth_short_1m_tp0",
-            direction="short", horizon_m=1, threshold=0.82, coin="ETH",
-            model_dir=os.path.join(args.models_dir, "eth", "short_1m_tp0"),
+            name="btc_short_2m_tp2",
+            direction="short", horizon_m=2, threshold=0.86, coin="BTC",
+            model_dir=os.path.join(args.models_dir, "btc", "short_2m_tp2"),
         ),
         ModelConfig(
-            name="eth_short_2m_tp0",
-            direction="short", horizon_m=2, threshold=0.80, coin="ETH",
-            model_dir=os.path.join(args.models_dir, "eth", "short_2m_tp0"),
+            name="btc_long_5m_tp2",
+            direction="long", horizon_m=5, threshold=0.84, coin="BTC",
+            model_dir=os.path.join(args.models_dir, "btc", "long_5m_tp2"),
         ),
-        # SOL models (3): 1 long + 2 short
+        # ETH models (2)
         ModelConfig(
-            name="sol_long_1m_tp2",
-            direction="long", horizon_m=1, threshold=0.76, coin="SOL",
-            model_dir=os.path.join(args.models_dir, "sol", "long_1m_tp2"),
-        ),
-        ModelConfig(
-            name="sol_short_1m_tp0",
-            direction="short", horizon_m=1, threshold=0.80, coin="SOL",
-            model_dir=os.path.join(args.models_dir, "sol", "short_1m_tp0"),
+            name="eth_short_2m_tp2",
+            direction="short", horizon_m=2, threshold=0.86, coin="ETH",
+            model_dir=os.path.join(args.models_dir, "eth", "short_2m_tp2"),
         ),
         ModelConfig(
-            name="sol_short_2m_tp0",
-            direction="short", horizon_m=2, threshold=0.78, coin="SOL",
-            model_dir=os.path.join(args.models_dir, "sol", "short_2m_tp0"),
+            name="eth_short_5m_tp5",
+            direction="short", horizon_m=5, threshold=0.84, coin="ETH",
+            model_dir=os.path.join(args.models_dir, "eth", "short_5m_tp5"),
+        ),
+        # SOL models (3)
+        ModelConfig(
+            name="sol_short_1m_tp2",
+            direction="short", horizon_m=1, threshold=0.88, coin="SOL",
+            model_dir=os.path.join(args.models_dir, "sol", "short_1m_tp2"),
+        ),
+        ModelConfig(
+            name="sol_short_2m_tp2",
+            direction="short", horizon_m=2, threshold=0.82, coin="SOL",
+            model_dir=os.path.join(args.models_dir, "sol", "short_2m_tp2"),
+        ),
+        ModelConfig(
+            name="sol_long_1m_tp0",
+            direction="long", horizon_m=1, threshold=0.86, coin="SOL",
+            model_dir=os.path.join(args.models_dir, "sol", "long_1m_tp0"),
         ),
     ]
 
@@ -918,13 +877,6 @@ def main():
             logger.error(f"Model dir not found: {mc.model_dir}")
             logger.error("Run export_models.py first.")
             sys.exit(1)
-
-    # Write pidfile for watchdog (must happen before initialize() which can hang on HL)
-    try:
-        with open('/home/ec2-user/xgb_bot/xgb_bot.pid', 'w') as _pf:
-            _pf.write(str(os.getpid()))
-    except Exception as _pe:
-        logger.warning(f"pidfile write failed: {_pe}")
 
     bot = XGBBot(
         model_configs=model_configs,

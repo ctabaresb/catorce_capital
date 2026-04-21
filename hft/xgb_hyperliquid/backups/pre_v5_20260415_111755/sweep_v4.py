@@ -37,11 +37,6 @@ from sklearn.metrics import (
     precision_score, recall_score, fbeta_score,
 )
 
-# v5: import lazy target computation
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _REPO_ROOT)
-from data.targets import compute_targets, COST_REAL  # noqa: E402
-
 try:
     from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
     HAS_HYPEROPT = True
@@ -87,16 +82,6 @@ BANNED_EXACT = {
     "twap_60m", "twap_240m", "twap_720m",
     "bn_mid", "bn_close", "bn_open", "bn_high", "bn_low",
     "cb_mid", "cb_close", "cb_open", "cb_high", "cb_low",
-    # v5: all-NaN under tick-aggregated leader data (no trade-flow in quote ticks)
-    "bn_volume", "bn_n_trades", "bn_taker_buy_vol", "bn_quote_vol",
-    "bn_vol_ratio", "bn_vol_zscore",
-    "bn_taker_imb", "bn_taker_imb_3m", "bn_taker_imb_5m", "bn_taker_imb_10m",
-    "cb_volume", "cb_n_trades", "cb_taker_buy_vol", "cb_quote_vol",
-    "cb_vol_ratio", "cb_vol_zscore",
-    "cb_taker_imb", "cb_taker_imb_3m", "cb_taker_imb_5m", "cb_taker_imb_10m",
-    # v5b: dropped due to eth_binance recorder asymmetry diagnosed Apr 13.
-    # See conversation Apr 14. cb_uptick_ratio is KEPT (clean, top-ranked feature).
-    "bn_uptick_ratio",
 }
 
 
@@ -330,16 +315,10 @@ def walk_forward_sweep(df, feature_cols, horizon, direction,
                               early_stopping_rounds=30, verbose_eval=False)
                 models.append(m)
             pred = np.mean([m.predict(dm_te) for m in models], axis=0)
-            pred_val = np.mean([m.predict(dval) for m in models], axis=0)
             for m in models:
                 mi = m.get_score(importance_type="gain")
                 for k, v in mi.items():
                     all_imp[k] = all_imp.get(k, 0) + v / len(models)
-
-        # v5b: also capture val predictions so evaluate_config can pick thr on val (no leakage)
-        # For hyperopt path, regenerate val preds from the best model
-        if use_hyperopt and HAS_HYPEROPT:
-            pred_val = model.predict(dval)
 
         fold_res = pd.DataFrame({
             "ts_min": test_d["ts_min"].values,
@@ -348,19 +327,8 @@ def walk_forward_sweep(df, feature_cols, horizon, direction,
             "tp_pnl": pd.to_numeric(test_d[tp_col], errors="coerce").values,
             "pred_prob": pred,
             "fold": fold,
-            "split": "test",
         })
-        # Stack val + test rows; flag with `split` so evaluate_config can split them apart
-        val_res = pd.DataFrame({
-            "ts_min": val_d["ts_min"].values,
-            "y_true": val_d[target_col].astype(int).values,
-            "p2p_ret": pd.to_numeric(val_d[p2p_col], errors="coerce").values,
-            "tp_pnl": pd.to_numeric(val_d[tp_col], errors="coerce").values,
-            "pred_prob": pred_val,
-            "fold": fold,
-            "split": "val",
-        })
-        results.append(pd.concat([val_res, fold_res], ignore_index=True))
+        results.append(fold_res)
 
         fold += 1
         test_start += pd.Timedelta(days=step_days)
@@ -375,169 +343,73 @@ def walk_forward_sweep(df, feature_cols, horizon, direction,
 # ---------------------------------------------------------------------------
 
 def evaluate_config(oos, direction, horizon, tp, feat_set_name, n_feats):
-    """
-    v5b: per-fold val→test threshold selection.
-
-    For each fold:
-      1. Sweep thresholds 0.50→0.90 on VAL predictions.
-      2. Pick the val-best threshold by mean_bps (only configs with >= 5 trades on val).
-      3. Apply that threshold to TEST predictions.
-      4. Aggregate test results across folds.
-
-    The ROW emitted per (config, threshold) reports test metrics where threshold
-    was the val-winner in that fold's bucket. Because different folds may pick
-    different thresholds, we report a synthetic 'effective_thr' = mode across folds.
-
-    BACKWARD-COMPAT: also emits the old style "thr swept on full OOS" rows for
-    comparison, tagged with select_method='test_peak' (legacy / biased) vs
-    'val_select' (honest / new). The CSV consumer can filter on this.
-
-    If the input `oos` frame has no 'split' column (legacy), falls back to the
-    old test-peak behavior.
-    """
     if oos.empty:
         return []
 
-    has_split = "split" in oos.columns
+    y_oos = oos["y_true"].values
+    p_oos = oos["pred_prob"].values
+    tp_oos = oos["tp_pnl"].values
+    p2p_oos = oos["p2p_ret"].values
+    n_folds = oos["fold"].nunique()
+    oos_days = max(1, (oos["ts_min"].max() - oos["ts_min"].min()).total_seconds() / 86400)
+
+    try:
+        auc = roc_auc_score(y_oos, p_oos)
+        ap = average_precision_score(y_oos, p_oos)
+    except Exception:
+        auc, ap = 0.5, 0.5
+
     rows = []
-
-    # ── Option A: honest val→test selection ───────────────────────────────
-    if has_split:
-        val_oos = oos[oos["split"] == "val"]
-        test_oos = oos[oos["split"] == "test"]
-    else:
-        val_oos = oos.iloc[0:0]  # empty
-        test_oos = oos
-
-    if not test_oos.empty:
-        try:
-            auc = roc_auc_score(test_oos["y_true"], test_oos["pred_prob"])
-            ap = average_precision_score(test_oos["y_true"], test_oos["pred_prob"])
-        except Exception:
-            auc, ap = 0.5, 0.5
-        oos_days = max(1, (test_oos["ts_min"].max() - test_oos["ts_min"].min()).total_seconds() / 86400)
-        n_folds_test = test_oos["fold"].nunique()
-    else:
-        auc, ap, oos_days, n_folds_test = 0.5, 0.5, 1, 0
-
-    # ── Honest path: pick thr on val per fold, apply to that fold's test ──
-    if not val_oos.empty and not test_oos.empty:
-        val_thr_per_fold = {}
-        for fid in val_oos["fold"].unique():
-            fv = val_oos[val_oos["fold"] == fid]
-            best_thr, best_mean = None, -np.inf
-            for thr in np.arange(0.50, 0.90, 0.02):
-                trade = fv["pred_prob"].values >= thr
-                if trade.sum() < 5:
-                    continue
-                pnl = fv["tp_pnl"].values[trade]
-                pnl = pnl[np.isfinite(pnl)]
-                if len(pnl) < 5:
-                    continue
-                if pnl.mean() > best_mean:
-                    best_mean = pnl.mean()
-                    best_thr = thr
-            val_thr_per_fold[fid] = best_thr
-
-        # Apply val-thr to test per fold, aggregate
-        test_pnl_all = []
-        test_n = 0
-        per_fold_pos = 0
-        per_fold_tot = 0
-        thrs_used = []
-        for fid, thr in val_thr_per_fold.items():
-            if thr is None:
-                continue
-            ft = test_oos[test_oos["fold"] == fid]
-            trade = ft["pred_prob"].values >= thr
-            if trade.sum() == 0:
-                continue
-            pnl = ft["tp_pnl"].values[trade]
-            pnl = pnl[np.isfinite(pnl)]
-            if len(pnl) == 0:
-                continue
-            per_fold_tot += 1
-            if pnl.mean() > 0:
-                per_fold_pos += 1
-            test_pnl_all.extend(pnl.tolist())
-            test_n += int(trade.sum())
-            thrs_used.append(thr)
-
-        if test_n > 0 and len(test_pnl_all) > 0:
-            arr = np.asarray(test_pnl_all)
-            effective_thr = float(np.median(thrs_used)) if thrs_used else np.nan
-            rows.append({
-                "direction": direction, "horizon": horizon, "tp_bps": tp,
-                "feat_set": feat_set_name, "n_feats": n_feats,
-                "select_method": "val_select",
-                "thr": effective_thr,
-                "thrs_used": ";".join(f"{t:.2f}" for t in thrs_used),
-                "auc": auc, "ap": ap,
-                "n_trades": int(test_n),
-                "prec": float((arr > 0).mean()),  # we don't have y_true filtering by fold-thr easily; use win_rate as proxy
-                "recall": np.nan, "f05": np.nan,
-                "mean_bps": float(arr.mean()),
-                "p2p_mean_bps": np.nan,
-                "win_rate": float((arr > 0).mean()),
-                "sharpe": float(arr.mean() / (arr.std() + 1e-12)),
-                "daily_trades": test_n / oos_days,
-                "daily_bps": float(arr.sum()) / oos_days,
-                "pos_folds": f"{per_fold_pos}/{per_fold_tot}",
-                "n_folds": n_folds_test, "oos_days": oos_days,
-                "score": float(arr.mean()) * float((arr > 0).mean()) if arr.mean() > 0 else float(arr.mean()) * 0.5,
-            })
-
-    # ── Legacy path: also emit thr swept on test (biased, for comparison) ──
-    # This preserves the old behavior so we can see the bias magnitude.
-    eval_oos = test_oos if not test_oos.empty else oos
-    y_oos = eval_oos["y_true"].values
-    p_oos = eval_oos["pred_prob"].values
-    tp_oos = eval_oos["tp_pnl"].values
-    p2p_oos = eval_oos["p2p_ret"].values
-
     for thr in np.arange(0.50, 0.90, 0.02):
         trade = p_oos >= thr
         n_trades = int(trade.sum())
         if n_trades < 10:
             continue
+
         traded_pnl = tp_oos[trade]
         traded_pnl = traded_pnl[np.isfinite(traded_pnl)]
         if len(traded_pnl) == 0:
             continue
+
         traded_p2p = p2p_oos[trade]
         traded_p2p = traded_p2p[np.isfinite(traded_p2p)]
+
         pred_binary = trade.astype(int)
         prec = precision_score(y_oos, pred_binary, zero_division=0)
         rec = recall_score(y_oos, pred_binary, zero_division=0)
         f05 = fbeta_score(y_oos, pred_binary, beta=0.5, zero_division=0)
+
         mean_bps = float(traded_pnl.mean())
         win_rate = float((traded_pnl > 0).mean())
         daily_trades = n_trades / oos_days
         daily_bps = float(traded_pnl.sum()) / oos_days
         sharpe = float(traded_pnl.mean() / (traded_pnl.std() + 1e-12))
         p2p_mean = float(traded_p2p.mean()) if len(traded_p2p) > 0 else 0
-        pos_folds = 0; tot_folds = 0
-        for fid in eval_oos["fold"].unique():
-            fm = eval_oos["fold"] == fid
-            ft = eval_oos.loc[fm, "pred_prob"].values >= thr
-            fp = eval_oos.loc[fm, "tp_pnl"].values[ft]
+
+        # Per-fold positivity
+        pos_folds = 0
+        tot_folds = 0
+        for fid in oos["fold"].unique():
+            fm = oos["fold"] == fid
+            ft = oos.loc[fm, "pred_prob"].values >= thr
+            fp = oos.loc[fm, "tp_pnl"].values[ft]
             fp = fp[np.isfinite(fp)]
             if len(fp) > 0:
                 tot_folds += 1
                 if fp.mean() > 0:
                     pos_folds += 1
+
         rows.append({
             "direction": direction, "horizon": horizon, "tp_bps": tp,
             "feat_set": feat_set_name, "n_feats": n_feats,
-            "select_method": "test_peak",
-            "thr": thr, "thrs_used": "",
-            "auc": auc, "ap": ap,
+            "thr": thr, "auc": auc, "ap": ap,
             "n_trades": n_trades, "prec": prec, "recall": rec, "f05": f05,
             "mean_bps": mean_bps, "p2p_mean_bps": p2p_mean,
             "win_rate": win_rate, "sharpe": sharpe,
             "daily_trades": daily_trades, "daily_bps": daily_bps,
             "pos_folds": f"{pos_folds}/{tot_folds}",
-            "n_folds": n_folds_test, "oos_days": oos_days,
+            "n_folds": n_folds, "oos_days": oos_days,
+            # Composite score for ranking
             "score": prec * mean_bps if mean_bps > 0 else prec * mean_bps * 0.5,
         })
 
@@ -555,8 +427,7 @@ def main():
                     choices=["short", "long", "both"])
     ap.add_argument("--horizons", nargs="+", type=int, default=[1, 2, 5, 10])
     ap.add_argument("--tp_levels", nargs="+", type=int, default=[0, 2, 5])
-    ap.add_argument("--train_days", type=int, default=21,
-                    help="WF training window (v5b: bumped from 14 -> 21 for better regime coverage)")
+    ap.add_argument("--train_days", type=int, default=14)
     ap.add_argument("--val_days", type=int, default=3)
     ap.add_argument("--step_days", type=int, default=3)
     ap.add_argument("--max_evals", type=int, default=20)
@@ -572,11 +443,6 @@ def main():
     ap.add_argument("--out_dir", default="output/sweep_v4")
     ap.add_argument("--ban_features", type=str, default="",
                     help="Comma-separated list of features to ban (e.g. bn_n_trades,bn_volume)")
-    # v6: train through Apr 12 (includes uptrend + downtrend regimes).
-    # Apr 13-15 = val, Apr 16-18 = holdout, Apr 19-20 = reserve.
-    ap.add_argument("--train_end_date", type=str, default="2026-04-13",
-                    help="ISO date (UTC). Sweep only uses data strictly before this. "
-                         "Pass empty string to disable slicing.")
     args = ap.parse_args()
 
     basename = os.path.basename(args.parquet)
@@ -608,22 +474,6 @@ def main():
     print(f"\n  Loaded: {df.shape[0]:,} rows x {df.shape[1]} cols")
     span = (df["ts_min"].max() - df["ts_min"].min()).total_seconds() / 86400
     print(f"  Time: {df['ts_min'].min().date()} -> {df['ts_min'].max().date()} ({span:.0f}d)")
-
-    # v5: slice to training window (locked scope: Mar 8 -> Apr 5).
-    # Val (Apr 6-8) and holdout (Apr 9-11) stay clean for downstream evaluation.
-    if args.train_end_date:
-        cutoff = pd.Timestamp(args.train_end_date, tz="UTC")
-        before = len(df)
-        df = df[df["ts_min"] < cutoff].reset_index(drop=True)
-        print(f"  Sliced to train_end_date={args.train_end_date}: "
-              f"{before:,} -> {len(df):,} rows "
-              f"({df['ts_min'].min().date()} -> {df['ts_min'].max().date()})")
-
-    # v5: compute targets lazily with COST_REAL (4.59 bps RT: 3.24 taker + 1.35 maker).
-    # Targets are NOT in the feature parquet anymore — must be computed here.
-    print(f"  Computing targets: {COST_REAL.describe()}")
-    df = compute_targets(df, cost=COST_REAL)
-    print(f"  After targets: {df.shape[1]} cols")
 
     all_feature_cols = get_feature_columns(df)
 
@@ -668,12 +518,6 @@ def main():
                 dff = df[mask].copy().reset_index(drop=True)
                 base = float(dff[target_col].astype(int).mean())
 
-                # v5b leakage fix: feature selection must NOT see later folds' OOS data.
-                # Cap dff at the first fold's val_start = ts.min() + train_days days.
-                # This means top-features are derived from the first train window only.
-                feat_sel_cutoff = dff["ts_min"].min() + pd.Timedelta(days=args.train_days)
-                dff_for_feat_sel = dff[dff["ts_min"] < feat_sel_cutoff]
-
                 for feat_set in args.feat_sets:
                     for optimizer in args.optimizers:
                         config_i += 1
@@ -681,7 +525,7 @@ def main():
                             cache_key = f"{direction}_{horizon}m"
                             if cache_key not in top_features_cache:
                                 top_features_cache[cache_key] = get_top_features(
-                                    dff_for_feat_sel, all_feature_cols, target_col,
+                                    dff, all_feature_cols, target_col,
                                     top_n=args.top_n_feats,
                                 )
                             feature_cols = top_features_cache[cache_key]
