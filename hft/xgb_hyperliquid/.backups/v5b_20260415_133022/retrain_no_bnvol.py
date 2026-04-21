@@ -2,7 +2,7 @@
 """
 retrain_no_bnvol.py — Multi-asset model export for BTC, ETH, SOL
 
-Exports to: models/live_v6/{btc,eth,sol}/{model_name}/
+Exports to: models/live_v3/{btc,eth,sol}/{model_name}/
 """
 
 import json, os, sys, time, warnings
@@ -27,9 +27,6 @@ BANNED_BN_VOL = {
     "cb_volume", "cb_n_trades", "cb_taker_buy_vol", "cb_quote_vol",
     "cb_vol_ratio", "cb_vol_zscore",
     "cb_taker_imb", "cb_taker_imb_3m", "cb_taker_imb_5m", "cb_taker_imb_10m",
-    # v5b: dropped due to eth_binance recorder asymmetry diagnosed Apr 13.
-    # cb_uptick_ratio is KEPT (clean, top-ranked feature).
-    "bn_uptick_ratio",
 }
 
 BANNED_PREFIXES = [
@@ -52,23 +49,15 @@ BANNED_EXACT = {
 } | BANNED_BN_VOL
 
 # (asset, direction, horizon, tp_bps, top_n_or_None, threshold)
-# v6 portfolio — 9 models validated on Apr 16-18 holdout (the regime that killed v5).
-# Selection: holdout mean_bps >= 2.30, n_trades >= 10, reserve mean_bps > 0.
-# Threshold picked by max(daily_bps) on val (Apr 13-15).
-# Direction: 2L / 7S — short-biased, tested in bearish regime.
 MODEL_DEFS = [
-    # BTC (4 models: 1L + 3S)
-    ("btc_usd", "long",  1, 0, 75,   0.82),   # hold: n=80  mean=+4.71 win=71% resv=+4.53
-    ("btc_usd", "short", 1, 0, 75,   0.86),   # hold: n=36  mean=+5.21 win=69% resv=+13.42
-    ("btc_usd", "short", 2, 0, 75,   0.82),   # hold: n=64  mean=+3.89 win=80% resv=+9.95
-    ("btc_usd", "short", 5, 0, 75,   0.82),   # hold: n=42  mean=+5.16 win=88% resv=+13.73
-    # ETH (2 models: 0L + 2S)
-    ("eth_usd", "short", 1, 0, 75,   0.82),   # hold: n=66  mean=+4.16 win=59% resv=+5.28
-    ("eth_usd", "short", 2, 0, None, 0.80),   # hold: n=53  mean=+5.46 win=74% resv=+0.62
-    # SOL (3 models: 1L + 2S)
-    ("sol_usd", "long",  1, 2, 75,   0.76),   # hold: n=143 mean=+3.03 win=62% resv=+2.04
-    ("sol_usd", "short", 1, 0, 75,   0.80),   # hold: n=141 mean=+4.27 win=63% resv=+5.88
-    ("sol_usd", "short", 2, 0, 75,   0.78),   # hold: n=133 mean=+3.37 win=69% resv=+4.66
+    ("btc_usd", "short", 5, 0, 75,   0.82),
+    ("btc_usd", "short", 2, 2, 76,   0.86),
+    ("btc_usd", "long",  5, 2, 77,   0.84),
+    ("eth_usd", "short", 2, 2, 76,   0.86),
+    ("eth_usd", "short", 5, 5, 76,   0.84),
+    ("sol_usd", "short", 1, 2, 77,   0.88),
+    ("sol_usd", "short", 2, 2, None, 0.82),
+    ("sol_usd", "long",  1, 0, 76,   0.86),
 ]
 
 ASSET_TO_DIR = {"btc_usd": "btc", "eth_usd": "eth", "sol_usd": "sol"}
@@ -210,7 +199,7 @@ def train_and_export(df, feature_cols, target_col, direction, horizon, out_dir, 
 def main():
     # v5: export to its own directory to avoid mixing with live v3 models.
     # Bot's --models_dir must be updated to this path at deploy time.
-    out_base = "models/live_v6"
+    out_base = "models/live_v5"
 
     assets = {}
     for asset, direction, horizon, tp, top_n, thr in MODEL_DEFS:

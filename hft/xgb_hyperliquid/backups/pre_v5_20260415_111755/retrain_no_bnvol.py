@@ -2,34 +2,21 @@
 """
 retrain_no_bnvol.py — Multi-asset model export for BTC, ETH, SOL
 
-Exports to: models/live_v6/{btc,eth,sol}/{model_name}/
+Exports to: models/live_v3/{btc,eth,sol}/{model_name}/
 """
 
-import json, os, sys, time, warnings
+import json, os, time, warnings
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-
-# v5: import lazy target computation from data/targets.py
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _REPO_ROOT)
-from data.targets import compute_targets, COST_REAL, TargetSpec  # noqa: E402
 
 warnings.filterwarnings("ignore")
 RANDOM_SEED = 42
 
 BANNED_BN_VOL = {
-    # Binance volume/taker (all NaN under v4/v5 tick-aggregated leader data)
-    "bn_volume", "bn_n_trades", "bn_taker_buy_vol", "bn_quote_vol",
-    "bn_vol_ratio", "bn_vol_zscore",
-    "bn_taker_imb", "bn_taker_imb_3m", "bn_taker_imb_5m", "bn_taker_imb_10m",
-    # Coinbase volume/taker (all NaN — taker always NaN, volume NaN under v4/v5)
-    "cb_volume", "cb_n_trades", "cb_taker_buy_vol", "cb_quote_vol",
-    "cb_vol_ratio", "cb_vol_zscore",
-    "cb_taker_imb", "cb_taker_imb_3m", "cb_taker_imb_5m", "cb_taker_imb_10m",
-    # v5b: dropped due to eth_binance recorder asymmetry diagnosed Apr 13.
-    # cb_uptick_ratio is KEPT (clean, top-ranked feature).
-    "bn_uptick_ratio",
+    "bn_n_trades", "bn_taker_buy_vol", "bn_volume", "bn_quote_vol",
+    "bn_taker_imb", "bn_vol_ratio",
+    "bn_taker_imb_3m", "bn_taker_imb_5m", "bn_taker_imb_10m",
 }
 
 BANNED_PREFIXES = [
@@ -52,23 +39,15 @@ BANNED_EXACT = {
 } | BANNED_BN_VOL
 
 # (asset, direction, horizon, tp_bps, top_n_or_None, threshold)
-# v6 portfolio — 9 models validated on Apr 16-18 holdout (the regime that killed v5).
-# Selection: holdout mean_bps >= 2.30, n_trades >= 10, reserve mean_bps > 0.
-# Threshold picked by max(daily_bps) on val (Apr 13-15).
-# Direction: 2L / 7S — short-biased, tested in bearish regime.
 MODEL_DEFS = [
-    # BTC (4 models: 1L + 3S)
-    ("btc_usd", "long",  1, 0, 75,   0.82),   # hold: n=80  mean=+4.71 win=71% resv=+4.53
-    ("btc_usd", "short", 1, 0, 75,   0.86),   # hold: n=36  mean=+5.21 win=69% resv=+13.42
-    ("btc_usd", "short", 2, 0, 75,   0.82),   # hold: n=64  mean=+3.89 win=80% resv=+9.95
-    ("btc_usd", "short", 5, 0, 75,   0.82),   # hold: n=42  mean=+5.16 win=88% resv=+13.73
-    # ETH (2 models: 0L + 2S)
-    ("eth_usd", "short", 1, 0, 75,   0.82),   # hold: n=66  mean=+4.16 win=59% resv=+5.28
-    ("eth_usd", "short", 2, 0, None, 0.80),   # hold: n=53  mean=+5.46 win=74% resv=+0.62
-    # SOL (3 models: 1L + 2S)
-    ("sol_usd", "long",  1, 2, 75,   0.76),   # hold: n=143 mean=+3.03 win=62% resv=+2.04
-    ("sol_usd", "short", 1, 0, 75,   0.80),   # hold: n=141 mean=+4.27 win=63% resv=+5.88
-    ("sol_usd", "short", 2, 0, 75,   0.78),   # hold: n=133 mean=+3.37 win=69% resv=+4.66
+    ("btc_usd", "short", 5, 0, 75,   0.82),
+    ("btc_usd", "short", 2, 2, 76,   0.86),
+    ("btc_usd", "long",  5, 2, 77,   0.84),
+    ("eth_usd", "short", 2, 2, 76,   0.86),
+    ("eth_usd", "short", 5, 5, 76,   0.84),
+    ("sol_usd", "short", 1, 2, 77,   0.88),
+    ("sol_usd", "short", 2, 2, None, 0.82),
+    ("sol_usd", "long",  1, 0, 76,   0.86),
 ]
 
 ASSET_TO_DIR = {"btc_usd": "btc", "eth_usd": "eth", "sol_usd": "sol"}
@@ -191,14 +170,8 @@ def train_and_export(df, feature_cols, target_col, direction, horizon, out_dir, 
     meta = {
         "direction": direction, "horizon_m": horizon, "tp_bps": tp_bps,
         "n_features": len(feature_cols), "n_train": len(train_d),
-        "base_rate": float(y_tr.mean()),
-        # v5: cost breakdown from data/targets.py::COST_REAL
-        "entry_fee_bps": COST_REAL.entry_fee_bps,
-        "exit_fee_bps": COST_REAL.exit_fee_bps,
-        "extra_buffer_bps": COST_REAL.extra_buffer_bps,
-        "rt_cost_bps": COST_REAL.rt_bps,
-        "target_version": "v5_bidask",
-        "excluded": sorted(BANNED_BN_VOL),
+        "base_rate": float(y_tr.mean()), "cost_bps": 5.4,
+        "excluded": list(BANNED_BN_VOL),
         "train_date": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
     }
     with open(os.path.join(model_dir, "meta.json"), "w") as f:
@@ -208,9 +181,7 @@ def train_and_export(df, feature_cols, target_col, direction, horizon, out_dir, 
 
 
 def main():
-    # v5: export to its own directory to avoid mixing with live v3 models.
-    # Bot's --models_dir must be updated to this path at deploy time.
-    out_base = "models/live_v6"
+    out_base = "models/live_v3"
 
     assets = {}
     for asset, direction, horizon, tp, top_n, thr in MODEL_DEFS:
@@ -230,11 +201,6 @@ def main():
         df = pd.read_parquet(parquet)
         df["ts_min"] = pd.to_datetime(df["ts_min"], utc=True)
         print(f"  Loaded: {df.shape[0]:,} rows x {df.shape[1]} cols")
-
-        # v5: compute targets lazily — feature parquet no longer contains them
-        print(f"  Computing targets lazily with cost={COST_REAL.describe()}")
-        df = compute_targets(df, cost=COST_REAL)
-        print(f"  After targets: {df.shape[0]:,} rows x {df.shape[1]} cols")
 
         all_features = get_feature_columns(df)
         print(f"  Features: {len(all_features)}")
