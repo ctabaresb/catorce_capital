@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Catorce Capital — Portfolio Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg-primary:#ffffff;--bg-secondary:#f7f7f5;--bg-card:#ffffff;
+  --text-primary:#1a1a18;--text-secondary:#6b6b67;--text-muted:#9b9b97;
+  --border:#e8e8e4;--border-strong:#d0d0cc;
+  --green:#0F6E56;--green-bg:#E1F5EE;
+  --red:#A32D2D;--red-bg:#FCEBEB;
+  --teal:#1D9E75;--blue:#185FA5;--purple:#534AB7;
+  --coral:#993C1D;--amber:#854F0B;--pink:#993556;
+}
+@media(prefers-color-scheme:dark){
+  :root{
+    --bg-primary:#1c1c1a;--bg-secondary:#242422;--bg-card:#242422;
+    --text-primary:#f0f0ec;--text-secondary:#9b9b97;--text-muted:#6b6b67;
+    --border:#333330;--border-strong:#444440;
+    --green:#5DCAA5;--green-bg:#04342C;
+    --red:#F09595;--red-bg:#501313;
+  }
+}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:var(--bg-secondary);color:var(--text-primary);
+  min-height:100vh;padding:2rem;
+  font-size:15px;line-height:1.6;
+}
+.container{max-width:1100px;margin:0 auto}
+.cfg{
+  background:var(--bg-card);border:0.5px solid var(--border);
+  border-radius:12px;padding:1.25rem;margin-bottom:1.75rem;
+}
+.cfg h3{font-size:13px;font-weight:500;color:var(--text-secondary);margin-bottom:12px}
+.cfg-row{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end}
+.cfg label{font-size:12px;color:var(--text-muted);display:block;margin-bottom:5px}
+.cfg input{
+  width:100%;font-size:13px;padding:7px 11px;
+  border:0.5px solid var(--border-strong);border-radius:8px;
+  background:var(--bg-secondary);color:var(--text-primary);outline:none;
+}
+.cfg input:focus{border-color:var(--teal)}
+.btn{
+  height:34px;padding:0 18px;font-size:13px;font-weight:500;
+  border:0.5px solid var(--teal);border-radius:8px;
+  background:var(--teal);color:#fff;cursor:pointer;white-space:nowrap;
+  transition:opacity .15s;
+}
+.btn:hover{opacity:.85}
+.header{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:1.75rem}
+.logo{font-size:22px;font-weight:600;letter-spacing:-0.5px}
+.logo em{color:var(--teal);font-style:normal}
+.tagline{font-size:12px;color:var(--text-muted);margin-top:3px}
+.badge{font-size:11px;padding:4px 11px;border-radius:20px;font-weight:500;display:inline-block}
+.badge.ok{background:var(--green-bg);color:var(--green)}
+.badge.err{background:var(--red-bg);color:var(--red)}
+.badge.load{background:var(--bg-secondary);color:var(--text-muted)}
+.last-upd{font-size:11px;color:var(--text-muted);margin-top:4px;text-align:right}
+.filter-row{display:flex;gap:6px;margin-bottom:1.25rem;align-items:center;flex-wrap:wrap}
+.filter-label{font-size:12px;color:var(--text-secondary);margin-right:2px}
+.pill{
+  font-size:12px;padding:5px 14px;border-radius:20px;
+  border:0.5px solid var(--border-strong);background:var(--bg-card);
+  color:var(--text-secondary);cursor:pointer;transition:all .15s;
+}
+.pill.active{background:var(--teal);border-color:var(--teal);color:#fff}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:1.25rem}
+@media(max-width:700px){.metrics{grid-template-columns:repeat(2,1fr)}}
+.metric{background:var(--bg-secondary);border-radius:8px;padding:14px 16px}
+.metric-label{font-size:12px;color:var(--text-muted);margin-bottom:6px}
+.metric-val{font-size:24px;font-weight:600}
+.metric-sub{font-size:11px;color:var(--text-muted);margin-top:3px}
+.green{color:var(--green)}.red{color:var(--red)}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+@media(max-width:700px){.charts{grid-template-columns:1fr}}
+.chart-card{
+  background:var(--bg-card);border:0.5px solid var(--border);
+  border-radius:12px;padding:1.1rem 1.25rem;
+}
+.chart-card.full{grid-column:1/-1}
+.chart-title{font-size:13px;font-weight:500;margin-bottom:2px}
+.chart-sub{font-size:11px;color:var(--text-muted);margin-bottom:12px}
+.chart-wrap{position:relative}
+.legend{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:10px;font-size:11px;color:var(--text-secondary)}
+.legend span{display:flex;align-items:center;gap:5px}
+.legend-dot{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.sim-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}
+@media(max-width:700px){.sim-grid{grid-template-columns:repeat(2,1fr)}}
+.sim-cell{background:var(--bg-secondary);border-radius:8px;padding:11px 13px}
+.sim-strategy{font-size:11px;color:var(--text-muted);margin-bottom:5px;text-transform:capitalize}
+.sim-prob{font-size:20px;font-weight:600;margin-bottom:2px}
+.sim-range{font-size:11px;color:var(--text-muted);line-height:1.5}
+.placeholder{font-size:13px;color:var(--text-muted);padding:2.5rem;text-align:center}
+.divider{border:none;border-top:0.5px solid var(--border);margin:12px 0}
+footer{text-align:center;font-size:11px;color:var(--text-muted);margin-top:2rem}
+</style>
+</head>
+<body onload="loadAll()">
+<div class="container">
+
+<div id="cfg-panel" style="display:none"></div>
+
+<div class="header">
+  <div>
+    <div class="logo">Catorce <em>Capital</em></div>
+    <div class="tagline" id="tagline">Crypto portfolio optimization platform</div>
+  </div>
+  <div>
+    <div id="status-badge" class="badge load">not connected</div>
+    <div class="last-upd" id="last-upd"></div>
+  </div>
+</div>
+
+<div class="filter-row">
+  <span class="filter-label">Portfolio profile</span>
+  <button class="pill active" onclick="setProfile('all',this)">All</button>
+  <button class="pill" onclick="setProfile('conservative',this)">Conservative</button>
+  <button class="pill" onclick="setProfile('balanced',this)">Balanced</button>
+  <button class="pill" onclick="setProfile('aggressive',this)">Aggressive</button>
+</div>
+
+<div class="metrics">
+  <div class="metric">
+    <div class="metric-label">Best Sharpe ratio</div>
+    <div class="metric-val" id="m-sharpe">—</div>
+    <div class="metric-sub" id="m-sharpe-sub">load data</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">Best CAGR</div>
+    <div class="metric-val" id="m-cagr">—</div>
+    <div class="metric-sub" id="m-cagr-sub">load data</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">Prob. positive return</div>
+    <div class="metric-val" id="m-prob">—</div>
+    <div class="metric-sub">1,000 GBM simulations</div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">Assets in universe</div>
+    <div class="metric-val" id="m-assets">—</div>
+    <div class="metric-sub" id="m-assets-sub">3 risk tiers</div>
+  </div>
+</div>
+
+<div class="charts">
+  <div class="chart-card full">
+    <div class="chart-title">Strategy performance — Sharpe ratio</div>
+    <div class="chart-sub">Average across all rebalancing frequencies and fee levels</div>
+    <div class="legend" id="strategy-legend"><span style="color:var(--text-muted)">Load data to view</span></div>
+    <div class="chart-wrap" style="height:210px">
+      <canvas id="strategy-chart" role="img" aria-label="Bar chart of Sharpe ratio by strategy and profile">Strategy Sharpe ratios.</canvas>
+    </div>
+  </div>
+
+  <div class="chart-card">
+    <div class="chart-title">Risk vs return</div>
+    <div class="chart-sub">CAGR vs max drawdown by strategy and profile</div>
+    <div class="chart-wrap" style="height:240px">
+      <canvas id="scatter-chart" role="img" aria-label="Scatter plot of CAGR vs max drawdown">Risk/return scatter.</canvas>
+    </div>
+  </div>
+
+  <div class="chart-card">
+    <div class="chart-title">Simulated CAGR distribution</div>
+    <div class="chart-sub">p5 / median / p95 across 1,000 correlated GBM paths</div>
+    <div class="chart-wrap" style="height:240px">
+      <canvas id="sim-chart" role="img" aria-label="Simulated CAGR distribution">Simulation distribution.</canvas>
+    </div>
+  </div>
+</div>
+
+<div class="chart-card" style="margin-bottom:1.5rem">
+  <div class="chart-title">Simulation summary</div>
+  <div class="chart-sub">Probability of achieving a positive 1-year CAGR across 1,000 correlated price paths</div>
+  <div class="sim-grid" id="sim-grid">
+    <div class="placeholder">Load data to view simulation results</div>
+  </div>
+</div>
+
+<footer>Catorce Capital · Data via CoinGecko · Powered by AWS</footer>
+
+</div>
+
+<script>
+const COLORS={
+  equal_weight:'#1D9E75',market_cap:'#185FA5',momentum:'#D85A30',
+  mvo_max_sharpe:'#7F77DD',mvo_min_variance:'#BA7517',risk_parity:'#D4537E'
+};
+const LABELS={
+  equal_weight:'Equal weight',market_cap:'Market cap',momentum:'Momentum',
+  mvo_max_sharpe:'MVO max Sharpe',mvo_min_variance:'MVO min variance',risk_parity:'Risk parity'
+};
+
+let currentProfile='all',allStrategies=[],allSims=[];
+let stratChart,scatChart,simChart;
+
+const WORKER_URL = "https://catorce-api-proxy.carlostabaresb.workers.dev"; // e.g. https://catorce-proxy.yourname.workers.dev
+
+async function apiFetch(path){
+  const r=await fetch(WORKER_URL+path);
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return r.json();
+}
+
+function setProfile(p,btn){
+  currentProfile=p;
+  document.querySelectorAll('.pill').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  renderAll();
+}
+
+async function loadAll(){
+  const badge=document.getElementById('status-badge');
+  badge.textContent='loading...';badge.className='badge load';
+  try{
+    const [health,strats,sims,universe]=await Promise.all([
+      apiFetch('/health'),apiFetch('/strategies'),
+      apiFetch('/simulations'),apiFetch('/universe')
+    ]);
+    badge.textContent='live';badge.className='badge ok';
+    document.getElementById('last-upd').textContent=
+      'Updated '+new Date(health.checked_at).toLocaleTimeString();
+    document.getElementById('tagline').textContent=
+      health.data_layers.silver_prices_date
+        ?'Data through '+health.data_layers.silver_prices_date
+        :'Crypto portfolio optimization platform';
+    document.getElementById('m-assets').textContent=universe.count||'—';
+    const cons=(universe.assets||[]).filter(a=>a.in_conservative).length;
+    document.getElementById('m-assets-sub').textContent=
+      cons+' conservative · '+(universe.count-cons)+' other';
+    allStrategies=strats.strategies||[];
+    allSims=sims.results||[];
+    renderAll();
+  }catch(e){
+    badge.textContent='error';badge.className='badge err';
+    console.error(e);
+  }
+}
+
+function filterData(arr){
+  return currentProfile==='all'?arr:arr.filter(d=>d.profile===currentProfile);
+}
+
+function renderAll(){
+  const data=filterData(allStrategies);
+  const sims=filterData(allSims);
+  updateMetrics(data,sims);
+  renderStrategyChart(data);
+  renderScatterChart(data);
+  renderSimChart(sims);
+  renderSimGrid(sims);
+}
+
+function updateMetrics(data,sims){
+  if(!data.length)return;
+  const best=[...data].sort((a,b)=>b.sharpe_ratio-a.sharpe_ratio)[0];
+  const bestC=[...data].sort((a,b)=>b.cagr-a.cagr)[0];
+  const sh=document.getElementById('m-sharpe');
+  sh.textContent=best.sharpe_ratio.toFixed(2);
+  sh.className='metric-val '+(best.sharpe_ratio>=0?'green':'red');
+  document.getElementById('m-sharpe-sub').textContent=
+    (LABELS[best.strategy_id]||best.strategy_id)+' · '+best.profile;
+  const cg=document.getElementById('m-cagr');
+  cg.textContent=(bestC.cagr*100).toFixed(1)+'%';
+  cg.className='metric-val '+(bestC.cagr>=0?'green':'red');
+  document.getElementById('m-cagr-sub').textContent=
+    (LABELS[bestC.strategy_id]||bestC.strategy_id)+' · '+bestC.profile;
+  if(sims.length){
+    const avg=sims.reduce((s,d)=>s+(d.prob_positive_cagr||0),0)/sims.length;
+    const pr=document.getElementById('m-prob');
+    pr.textContent=(avg*100).toFixed(0)+'%';
+    pr.className='metric-val '+(avg>=0.5?'green':'red');
+  }
+}
+
+function renderStrategyChart(data){
+  const strategies=[...new Set(data.map(d=>d.strategy_id))];
+  const profiles=currentProfile==='all'
+    ?['conservative','balanced','aggressive']:[currentProfile];
+  const datasets=strategies.map(s=>({
+    label:LABELS[s]||s,
+    data:profiles.map(p=>{
+      const r=data.find(d=>d.strategy_id===s&&d.profile===p);
+      return r?+r.sharpe_ratio.toFixed(3):null;
+    }),
+    backgroundColor:COLORS[s]||'#888',borderRadius:3
+  }));
+  document.getElementById('strategy-legend').innerHTML=strategies.map(s=>
+    `<span><span class="legend-dot" style="background:${COLORS[s]||'#888'}"></span>${LABELS[s]||s}</span>`
+  ).join('');
+  if(stratChart)stratChart.destroy();
+  stratChart=new Chart(document.getElementById('strategy-chart'),{
+    type:'bar',data:{labels:profiles,datasets},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{
+        x:{grid:{display:false},ticks:{color:'#888'}},
+        y:{grid:{color:'rgba(128,128,128,.12)'},ticks:{color:'#888'},
+          title:{display:true,text:'Sharpe ratio',color:'#888',font:{size:11}}}
+      }
+    }
+  });
+}
+
+function renderScatterChart(data){
+  const strategies=[...new Set(data.map(d=>d.strategy_id))];
+  const datasets=strategies.map(s=>({
+    label:LABELS[s]||s,
+    data:data.filter(d=>d.strategy_id===s).map(d=>({
+      x:+(d.cagr*100).toFixed(2),y:+(d.max_drawdown*100).toFixed(2),profile:d.profile
+    })),
+    backgroundColor:COLORS[s]||'#888',pointRadius:7,pointHoverRadius:9
+  }));
+  if(scatChart)scatChart.destroy();
+  scatChart=new Chart(document.getElementById('scatter-chart'),{
+    type:'scatter',data:{datasets},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{
+        label:c=>`${c.dataset.label} (${c.raw.profile}): CAGR ${c.raw.x}%, DD ${c.raw.y}%`
+      }}},
+      scales:{
+        x:{grid:{color:'rgba(128,128,128,.12)'},ticks:{color:'#888',callback:v=>v+'%'},
+          title:{display:true,text:'CAGR (%)',color:'#888',font:{size:11}}},
+        y:{grid:{color:'rgba(128,128,128,.12)'},ticks:{color:'#888',callback:v=>v+'%'},
+          title:{display:true,text:'Max drawdown (%)',color:'#888',font:{size:11}}}
+      }
+    }
+  });
+}
+
+function renderSimChart(sims){
+  if(!sims.length){if(simChart)simChart.destroy();return;}
+  const labels=sims.map(s=>{
+    const base=LABELS[s.strategy_id]||s.strategy_id;
+    return currentProfile==='all'?base+' ('+s.profile+')':base;
+  });
+  if(simChart)simChart.destroy();
+  simChart=new Chart(document.getElementById('sim-chart'),{
+    type:'bar',
+    data:{
+      labels,
+      datasets:[
+        {label:'p5 (worst 5%)',data:sims.map(s=>+((s.cagr_p5||0)*100).toFixed(1)),
+          backgroundColor:'rgba(224,75,70,.2)',borderColor:'rgba(224,75,70,.7)',borderWidth:1,borderRadius:2},
+        {label:'Median',data:sims.map(s=>+((s.cagr_p50||0)*100).toFixed(1)),
+          backgroundColor:'rgba(29,158,117,.35)',borderColor:'#1D9E75',borderWidth:1,borderRadius:2},
+        {label:'p95 (best 5%)',data:sims.map(s=>+((s.cagr_p95||0)*100).toFixed(1)),
+          backgroundColor:'rgba(24,95,165,.2)',borderColor:'rgba(24,95,165,.6)',borderWidth:1,borderRadius:2}
+      ]
+    },
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>`${c.dataset.label}: ${c.raw}%`}}},
+      scales:{
+        x:{grid:{display:false},ticks:{color:'#888',font:{size:10},maxRotation:30}},
+        y:{grid:{color:'rgba(128,128,128,.12)'},ticks:{color:'#888',callback:v=>v+'%'},
+          title:{display:true,text:'Simulated CAGR (%)',color:'#888',font:{size:11}}}
+      }
+    }
+  });
+}
+
+function renderSimGrid(sims){
+  const g=document.getElementById('sim-grid');
+  if(!sims.length){g.innerHTML='<div class="placeholder">No simulation data for this profile</div>';return;}
+  g.innerHTML=sims.map(s=>`
+    <div class="sim-cell">
+      <div class="sim-strategy">${LABELS[s.strategy_id]||s.strategy_id} · ${s.profile}</div>
+      <div class="sim-prob ${(s.prob_positive_cagr||0)>=0.5?'green':'red'}">${((s.prob_positive_cagr||0)*100).toFixed(0)}%</div>
+      <div class="sim-range">p5 / median / p95 CAGR<br>
+        ${((s.cagr_p5||0)*100).toFixed(0)}% &nbsp;/&nbsp;
+        ${((s.cagr_p50||0)*100).toFixed(0)}% &nbsp;/&nbsp;
+        ${((s.cagr_p95||0)*100).toFixed(0)}%
+      </div>
+    </div>`).join('');
+}
+</script>
+</body>
+</html>

@@ -26,13 +26,6 @@ import numpy as np
 import pandas as pd
 import yaml
 
-# v5: import lazy target computation. validate_hl.py lives in data/ and
-# targets.py is in the same folder.
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
-from targets import compute_targets, COST_REAL  # noqa: E402
-
 warnings.filterwarnings("ignore")
 
 PASS = "  PASS"
@@ -107,19 +100,7 @@ def validate(path):
 
     df = pd.read_parquet(path)
     n, ncols = df.shape
-    print(f"  Loaded: {n:,} rows x {ncols} cols")
-
-    # v5: feature parquets no longer contain targets. Compute them here so
-    # the existing target checks keep working. Uses data/targets.py::COST_REAL
-    # (4.59 bps RT = 3.24 taker + 1.35 maker, bid/ask-aware).
-    has_targets = any(c.startswith("target_") for c in df.columns)
-    if not has_targets:
-        print(f"  [v5] No targets in parquet — computing via data/targets.py "
-              f"({COST_REAL.describe()})")
-        df = compute_targets(df, cost=COST_REAL)
-        print(f"  After targets: {df.shape[0]:,} rows x {df.shape[1]} cols\n")
-    else:
-        print()
+    print(f"  Loaded: {n:,} rows x {ncols} cols\n")
 
     # 1. Shape
     print("-- 1. Shape --")

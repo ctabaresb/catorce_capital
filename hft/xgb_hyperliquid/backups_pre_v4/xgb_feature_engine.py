@@ -94,13 +94,6 @@ class MinuteBar:
     cb_mid: float = 0.0
     cb_close: float = 0.0
     cb_volume: float = 0.0
-    # v5: Tick-derived features (approximated from trades in live)
-    bn_n_ticks: int = 0
-    bn_uptick_ratio: float = 0.5
-    bn_flat_ratio: float = 0.5
-    cb_n_ticks: int = 0
-    cb_uptick_ratio: float = 0.5
-    cb_flat_ratio: float = 0.5
     # Cross-asset mids (keyed by prefix, e.g. "eth_usd", "sol_usd", "btc_usd")
     cross_mids: Dict[str, float] = field(default_factory=dict)
     # Flags
@@ -155,86 +148,6 @@ def fetch_coinbase_ticker(product: str = "BTC-USD") -> Optional[dict]:
     except Exception as e:
         logger.warning(f"Coinbase fetch failed: {e}")
         return None
-
-
-# ---------------------------------------------------------------------------
-# v5: Trade-level fetchers for tick features (n_ticks, uptick_ratio, flat_ratio)
-#
-# Training uses S3 quote-level ticks. In live, we approximate from recent
-# trades via REST API. The correlation is high: more quote updates ≈ more
-# trades, and price direction of trades tracks quote mid direction.
-# ---------------------------------------------------------------------------
-
-def fetch_binance_trades(symbol: str = "BTCUSDT", lookback_ms: int = 65_000) -> Optional[list]:
-    """Fetch recent aggregated trades from Binance for the last ~1 minute.
-    Returns list of dicts with 'price' and 'timestamp_ms' fields."""
-    try:
-        now_ms = int(time.time() * 1000)
-        url = "https://api.binance.us/api/v3/aggTrades"
-        resp = requests.get(url, params={
-            "symbol": symbol,
-            "startTime": now_ms - lookback_ms,
-            "endTime": now_ms,
-            "limit": 1000,
-        }, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        return [{"price": float(t["p"]), "timestamp_ms": int(t["T"])} for t in data]
-    except Exception as e:
-        logger.warning(f"Binance trades fetch failed: {e}")
-        return None
-
-
-def fetch_coinbase_trades(product: str = "BTC-USD", limit: int = 200) -> Optional[list]:
-    """Fetch recent trades from Coinbase.
-    Returns list of dicts with 'price' field, ordered oldest-first."""
-    try:
-        url = f"https://api.exchange.coinbase.com/products/{product}/trades"
-        resp = requests.get(url, params={"limit": limit}, timeout=5)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        # Coinbase returns newest-first, reverse for chronological order
-        trades = [{"price": float(t["price"])} for t in reversed(data)]
-        return trades
-    except Exception as e:
-        logger.warning(f"Coinbase trades fetch failed: {e}")
-        return None
-
-
-def compute_tick_features(trades: list) -> dict:
-    """Compute n_ticks, uptick_ratio, flat_ratio from a list of trade dicts.
-    Each trade must have a 'price' key.
-
-    These approximate the training pipeline's quote-tick features:
-      n_ticks     = count of ticks (trade count ≈ quote update count)
-      uptick_ratio = fraction of consecutive price changes that are UP
-      flat_ratio   = fraction of consecutive price changes that are FLAT (zero change)
-    """
-    n = len(trades)
-    if n < 2:
-        return {"n_ticks": n, "uptick_ratio": 0.5, "flat_ratio": 1.0}
-
-    ups = 0
-    flats = 0
-    total_transitions = 0
-    prev_px = trades[0]["price"]
-    for t in trades[1:]:
-        px = t["price"]
-        total_transitions += 1
-        if px > prev_px:
-            ups += 1
-        elif px == prev_px:
-            flats += 1
-        prev_px = px
-
-    denom = max(total_transitions, 1)
-    return {
-        "n_ticks": n,
-        "uptick_ratio": ups / denom,
-        "flat_ratio": flats / denom,
-    }
 
 
 def compute_dom_features(bids: list, asks: list, k: int = 10, k_small: int = 3):
@@ -409,27 +322,6 @@ class XGBFeatureEngine:
             bar.cb_close = _prev.cb_close
             bar.cb_volume = _prev.cb_volume
             logger.warning(f"{getattr(self, 'coin', '?')}: Coinbase fetch failed, carrying forward")
-
-        # v5: Tick features from recent trades (approximates S3 quote-tick features)
-        try:
-            bn_trades = fetch_binance_trades(self.bn_symbol)
-            if bn_trades and len(bn_trades) >= 2:
-                bn_tick = compute_tick_features(bn_trades)
-                bar.bn_n_ticks = bn_tick["n_ticks"]
-                bar.bn_uptick_ratio = bn_tick["uptick_ratio"]
-                bar.bn_flat_ratio = bn_tick["flat_ratio"]
-        except Exception as e:
-            logger.debug(f"Binance tick features failed: {e}")
-
-        try:
-            cb_trades = fetch_coinbase_trades(self.cb_product)
-            if cb_trades and len(cb_trades) >= 2:
-                cb_tick = compute_tick_features(cb_trades)
-                bar.cb_n_ticks = cb_tick["n_ticks"]
-                bar.cb_uptick_ratio = cb_tick["uptick_ratio"]
-                bar.cb_flat_ratio = cb_tick["flat_ratio"]
-        except Exception as e:
-            logger.debug(f"Coinbase tick features failed: {e}")
 
         # Cross-asset mids
         bar.cross_mids = cross_mids
@@ -839,20 +731,6 @@ class XGBFeatureEngine:
                     all_feats["cb_vol_zscore"] = (cur.cb_volume - vol_ma) / (vol_sd + 1e-12)
 
             all_feats["cb_volume"] = cur.cb_volume
-
-        # ── v5: Tick-derived features ─────────────────────────────────
-        # These approximate the training pipeline's S3 quote-tick features.
-        # In training: computed from bid/ask quote snapshots aggregated per minute.
-        # In live: computed from recent trades via REST API (correlated proxy).
-        all_feats["bn_n_ticks"] = cur.bn_n_ticks
-        all_feats["bn_flat_ratio"] = cur.bn_flat_ratio
-        # bn_uptick_ratio is BANNED in v5 (eth_binance recorder asymmetry)
-        # but we still populate it so median imputation isn't needed if
-        # a future model re-enables it.
-        all_feats["bn_uptick_ratio"] = cur.bn_uptick_ratio
-        all_feats["cb_n_ticks"] = cur.cb_n_ticks
-        all_feats["cb_uptick_ratio"] = cur.cb_uptick_ratio
-        all_feats["cb_flat_ratio"] = cur.cb_flat_ratio
 
         # ── Cross-asset ───────────────────────────────────────────────
         for prefix, _ in self.cross_assets:

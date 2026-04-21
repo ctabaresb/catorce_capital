@@ -266,24 +266,6 @@ def add_indicator_features(df, ind_df):
 # C. LEAD-LAG FEATURES (Binance + Coinbase)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _normalize_leadlag_kl(kl):
-    """
-    Normalize a leader parquet to the schema add_leadlag_features expects.
-    Handles both v3 (kline-based, download_leadlag.py) and v4 (tick-aggregated,
-    aggregate_leadlag_ticks.py) inputs.
-    """
-    kl = kl.copy()
-    # ts_min: int unix sec (v4) vs datetime64 (v3)
-    if pd.api.types.is_integer_dtype(kl["ts_min"].dtype):
-        kl["ts_min"] = pd.to_datetime(kl["ts_min"], unit="s", utc=True)
-    else:
-        kl["ts_min"] = pd.to_datetime(kl["ts_min"], utc=True)
-    # v4 short-name aliases -> v3 canonical
-    aliases = {"taker_buy_vol": "taker_buy_volume", "quote_vol": "quote_volume"}
-    kl = kl.rename(columns={k: v for k, v in aliases.items() if k in kl.columns})
-    return kl
-
-
 def add_leadlag_features(df, bn_path, cb_path, asset):
     """
     Merge Binance and Coinbase klines, compute lead-lag features.
@@ -299,7 +281,7 @@ def add_leadlag_features(df, bn_path, cb_path, asset):
             continue
 
         kl = pd.read_parquet(path)
-        kl = _normalize_leadlag_kl(kl)
+        kl["ts_min"] = pd.to_datetime(kl["ts_min"], utc=True)
 
         # Rename columns with prefix
         rename = {
@@ -312,13 +294,6 @@ def add_leadlag_features(df, bn_path, cb_path, asset):
             rename["taker_buy_volume"] = f"{prefix}_taker_buy_vol"
         if "quote_volume" in kl.columns:
             rename["quote_volume"] = f"{prefix}_quote_vol"
-        # v4: tick-derived columns (only present when source is aggregate_leadlag_ticks.py output)
-        if "n_ticks" in kl.columns:
-            rename["n_ticks"] = f"{prefix}_n_ticks"
-        if "flat_ratio" in kl.columns:
-            rename["flat_ratio"] = f"{prefix}_flat_ratio"
-        if "uptick_ratio" in kl.columns:
-            rename["uptick_ratio"] = f"{prefix}_uptick_ratio"
 
         kl_merge = kl[["ts_min"] + list(rename.keys())].rename(columns=rename)
         kl_merge = kl_merge.drop_duplicates(subset=["ts_min"], keep="last")
@@ -528,21 +503,153 @@ def add_time_features(df):
     d["hour_cos"] = np.cos(2 * np.pi * hour / 24)
     return d
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# F. BIDIRECTIONAL MFE TARGETS (long AND short)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def add_bidirectional_mfe_targets(df, horizons_m=None, cost_bps=3.0,
+                                   tp_levels_bps=None):
+    """
+    Bidirectional MFE targets for Hyperliquid perpetuals.
+
+    LONG MFE:  max(mid_{t+1}..mid_{t+H}) > mid_t * (1 + cost/2/1e4) + TP
+    SHORT MFE: min(mid_{t+1}..mid_{t+H}) < mid_t * (1 - cost/2/1e4) - TP
+
+    Cost is fee-based (not spread-based): half_cost = maker_fee_one_side = 1.5 bps
+    For cost_bps=3.0 (round-trip), half_cost = 1.5 bps each side.
+
+    P2P returns:
+      LONG:  mid_{t+H} * (1 - half_cost) / (mid_t * (1 + half_cost)) - 1
+      SHORT: mid_t * (1 - half_cost) / (mid_{t+H} * (1 + half_cost)) - 1
+    """
+    if horizons_m is None:
+        horizons_m = [1, 2, 5, 10]
+    if tp_levels_bps is None:
+        tp_levels_bps = [0, 2, 5]
+
+    d = df.copy()
+    mid = pd.to_numeric(d["mid_bbo"], errors="coerce").values.astype(float)
+    missing = d.get("was_missing_minute", pd.Series(0, index=d.index)).astype(int).values
+    n = len(mid)
+
+    half_cost = cost_bps / 2.0 / 1e4  # per side in decimal
+
+    for h in horizons_m:
+        # Build future mid prices matrix
+        future_mids = np.full((n, h), np.nan)
+        for k in range(1, h + 1):
+            shifted = np.empty(n)
+            shifted[:n - k] = mid[k:]
+            shifted[n - k:] = np.nan
+            future_mids[:, k - 1] = shifted
+
+        mfe_high = np.nanmax(future_mids, axis=1)    # best for longs
+        mfe_low = np.nanmin(future_mids, axis=1)     # best for shorts
+        end_mid = future_mids[:, -1]
+
+        # Entry/exit prices with fee cost
+        entry_long = mid * (1 + half_cost)     # buy: pay fee above mid
+        exit_long = mfe_high * (1 - half_cost)  # sell: receive fee below mid
+
+        entry_short = mid * (1 - half_cost)    # sell: receive fee below mid
+        exit_short = mfe_low * (1 + half_cost)  # buy to cover: pay fee above mid
+
+        # Validity
+        fwd_miss = np.zeros(n, dtype=float)
+        for k in range(1, h + 1):
+            sm = np.zeros(n, dtype=float)
+            sm[:n - k] = missing[k:]
+            sm[n - k:] = 1.0
+            fwd_miss = np.maximum(fwd_miss, sm)
+        valid = (fwd_miss == 0).astype(int)
+        valid[n - h:] = 0
+
+        d[f"fwd_valid_mfe_{h}m"] = valid
+
+        # ── LONG TARGETS ──────────────────────────────────────────────
+        for tp in tp_levels_bps:
+            tp_price = entry_long * (1 + tp / 1e4)
+            target = (exit_long > tp_price).astype(int)
+            target[valid == 0] = -1
+            d[f"target_long_{tp}bp_{h}m"] = target
+
+        # Long MFE return
+        d[f"mfe_long_ret_{h}m_bps"] = (exit_long / (entry_long + 1e-12) - 1) * 1e4
+
+        # Long P2P (point-to-point at horizon)
+        end_exit_long = end_mid * (1 - half_cost)
+        d[f"p2p_long_{h}m_bps"] = (end_exit_long / (entry_long + 1e-12) - 1) * 1e4
+
+        # Long TP exit simulation
+        for tp in tp_levels_bps:
+            tp_price_long = entry_long * (1 + tp / 1e4)
+            future_exits_long = future_mids * (1 - half_cost)
+            tp_hit = future_exits_long > tp_price_long[:, np.newaxis]
+            first_touch = np.full(n, -1, dtype=int)
+            for k in range(h):
+                not_yet = first_touch == -1
+                hit_now = tp_hit[:, k] & not_yet
+                first_touch[hit_now] = k
+            exit_price = np.where(
+                first_touch >= 0,
+                future_exits_long[np.arange(n), np.clip(first_touch, 0, h - 1)],
+                end_exit_long,
+            )
+            pnl = (exit_price / (entry_long + 1e-12) - 1) * 1e4
+            pnl[valid == 0] = np.nan
+            d[f"tp_long_{tp}bp_{h}m_bps"] = pnl
+
+        # ── SHORT TARGETS ─────────────────────────────────────────────
+        for tp in tp_levels_bps:
+            tp_price = entry_short * (1 - tp / 1e4)
+            target = (exit_short < tp_price).astype(int)
+            target[valid == 0] = -1
+            d[f"target_short_{tp}bp_{h}m"] = target
+
+        # Short MFE return
+        d[f"mfe_short_ret_{h}m_bps"] = (entry_short / (exit_short + 1e-12) - 1) * 1e4
+
+        # Short P2P
+        end_exit_short = end_mid * (1 + half_cost)
+        d[f"p2p_short_{h}m_bps"] = (entry_short / (end_exit_short + 1e-12) - 1) * 1e4
+
+        # Short TP exit simulation
+        for tp in tp_levels_bps:
+            tp_price_short = entry_short * (1 - tp / 1e4)
+            future_exits_short = future_mids * (1 + half_cost)
+            tp_hit = future_exits_short < tp_price_short[:, np.newaxis]
+            first_touch = np.full(n, -1, dtype=int)
+            for k in range(h):
+                not_yet = first_touch == -1
+                hit_now = tp_hit[:, k] & not_yet
+                first_touch[hit_now] = k
+            exit_price = np.where(
+                first_touch >= 0,
+                future_exits_short[np.arange(n), np.clip(first_touch, 0, h - 1)],
+                end_exit_short,
+            )
+            pnl = (entry_short / (exit_price + 1e-12) - 1) * 1e4
+            pnl[valid == 0] = np.nan
+            d[f"tp_short_{tp}bp_{h}m_bps"] = pnl
+
+        # Mid-to-mid (reference, no cost)
+        d[f"fwd_ret_MID_{h}m_bps"] = (end_mid / (mid + 1e-12) - 1) * 1e4
+
+    # Entry cost for the model to use as a feature
+    d["entry_cost_bps"] = cost_bps
+
+    return d
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # PIPELINE
 # ═════════════════════════════════════════════════════════════════════════════
 
 def build_hl_features(minute_path, output_path, config_path=None,
-                      horizons_m=None,
+                      horizons_m=None, cost_bps=3.0,
                       indicator_path=None, bn_path=None, cb_path=None,
                       asset="btc_usd"):
-    """
-    v5: Pure feature builder. No targets — those are computed lazily at
-    train/sweep time via data/targets.py (bid/ask-aware, parameterized cost).
-
-    horizons_m is accepted for back-compat but unused (it belonged to target
-    construction, which no longer happens here).
-    """
     if horizons_m is None:
         horizons_m = [1, 2, 5, 10]
 
@@ -550,12 +657,13 @@ def build_hl_features(minute_path, output_path, config_path=None,
     sep = "=" * 70
 
     print(f"\n{sep}")
-    print(f"  BUILD HL XGB FEATURES (v5 — features only, no targets)")
+    print(f"  BUILD HL XGB FEATURES")
     print(f"  Minute:     {minute_path}")
     print(f"  Indicators: {indicator_path or 'none'}")
     print(f"  Binance:    {bn_path or 'none'}")
     print(f"  Coinbase:   {cb_path or 'none'}")
     print(f"  Output:     {output_path}")
+    print(f"  Horizons:   {horizons_m}  |  Cost: {cost_bps} bps")
     print(sep)
 
     # ── Load ──────────────────────────────────────────────────────────────
@@ -580,31 +688,31 @@ def build_hl_features(minute_path, output_path, config_path=None,
         print(f"  Indicators: {len(ind_df):,} rows x {ind_df.shape[1]} cols")
 
     # ── Step 1: DOM velocity ──────────────────────────────────────────────
-    print(f"\n  [1/6] DOM velocity...")
+    print(f"\n  [1/7] DOM velocity...")
     df = add_dom_velocity_features(df)
     print(f"         +{df.shape[1] - n_base} features")
     n_after = df.shape[1]
 
     # ── Step 2: OFI ───────────────────────────────────────────────────────
-    print(f"  [2/6] OFI...")
+    print(f"  [2/7] OFI...")
     df = add_ofi_features(df)
     print(f"         +{df.shape[1] - n_after} features")
     n_after = df.shape[1]
 
     # ── Step 3: HL indicators ─────────────────────────────────────────────
-    print(f"  [3/6] HL indicators...")
+    print(f"  [3/7] HL indicators...")
     df = add_indicator_features(df, ind_df)
     print(f"         +{df.shape[1] - n_after} features")
     n_after = df.shape[1]
 
     # ── Step 4: Lead-lag ──────────────────────────────────────────────────
-    print(f"  [4/6] Lead-lag (Binance + Coinbase)...")
+    print(f"  [4/7] Lead-lag (Binance + Coinbase)...")
     df = add_leadlag_features(df, bn_path, cb_path, asset)
     print(f"         +{df.shape[1] - n_after} features")
     n_after = df.shape[1]
 
     # ── Step 5: Cross-asset + spread + returns + time ─────────────────────
-    print(f"  [5/6] Cross-asset + spread + returns + time...")
+    print(f"  [5/7] Cross-asset + spread + returns + time...")
     df = add_cross_asset_features(df)
     df = add_spread_dynamics(df)
     df = add_return_features(df)
@@ -612,12 +720,31 @@ def build_hl_features(minute_path, output_path, config_path=None,
     print(f"         +{df.shape[1] - n_after} features")
     n_after = df.shape[1]
 
-    # ── Step 6: Summary ───────────────────────────────────────────────────
-    print(f"\n  [6/6] Summary")
+    # ── Step 6: Bidirectional MFE targets ─────────────────────────────────
+    print(f"  [6/7] Bidirectional MFE targets (cost={cost_bps} bps)...")
+    df = add_bidirectional_mfe_targets(df, horizons_m, cost_bps)
+    print(f"         +{df.shape[1] - n_after} target columns")
+
+    # ── Step 7: Summary ───────────────────────────────────────────────────
+    print(f"\n  [7/7] Summary")
     total = df.shape[1]
     print(f"  Total: {df.shape[0]:,} rows x {total} cols (+{total - n_base} new)")
-    print(f"  NOTE: No targets in output. Compute them at train time via")
-    print(f"        data/targets.py::compute_targets(df, cost=COST_REAL)")
+
+    # Target statistics
+    print(f"\n  TARGET STATISTICS:")
+    missing_mask = df["was_missing_minute"] == 0
+    for direction in ["long", "short"]:
+        print(f"\n    {direction.upper()}:")
+        for h in horizons_m:
+            target_col = f"target_{direction}_0bp_{h}m"
+            p2p_col = f"p2p_{direction}_{h}m_bps"
+            valid_col = f"fwd_valid_mfe_{h}m"
+            if target_col in df.columns:
+                valid = (df[valid_col] == 1) & missing_mask & (df[target_col] >= 0)
+                t = df.loc[valid, target_col].astype(int)
+                p2p = pd.to_numeric(df.loc[valid, p2p_col], errors="coerce")
+                print(f"      {h}m: MFE_rate={t.mean():.4f} ({t.mean()*100:.1f}%)  "
+                      f"n={valid.sum():,}  P2P={p2p.mean():+.3f} bps")
 
     # ── Save ──────────────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -645,40 +772,19 @@ def main():
                     help="Process all HL minute parquets")
     ap.add_argument("--features_dir", default="data/artifacts_features")
     ap.add_argument("--out_dir", default=None)
+    ap.add_argument("--cost_bps", type=float, default=None,
+                    help="Override cost in bps (default: from config)")
     ap.add_argument("--horizons", nargs="+", type=int, default=None)
-    # v4: switch to tick-aggregated leader parquets from aggregate_leadlag_ticks.py
-    ap.add_argument("--leadlag_source", choices=["v3_klines", "v4_ticks"],
-                    default="v3_klines",
-                    help="v3=download_leadlag.py kline parquets (legacy), "
-                         "v4=aggregate_leadlag_ticks.py tick-aggregated parquets")
-    ap.add_argument("--leadlag_v4_dir", default="data/lead_lag_1m",
-                    help="Directory of v4 tick-aggregated leader parquets "
-                         "(used when --leadlag_source=v4_ticks)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    # v5: cost is no longer a feature-build parameter — it's a target-time param.
+    cost = args.cost_bps or cfg["cost"]["default_cost_bps"]
     horizons = args.horizons or cfg["feature_build"]["mfe_horizons_m"]
     out_dir = args.out_dir or cfg["output"]["xgb_dir"]
     leadlag_dir = cfg["output"]["leadlag_dir"]
     ind_dir = cfg["output"]["indicators_dir"]
     bn_symbols = cfg["leadlag"]["binance"]["symbols"]
     cb_symbols = cfg["leadlag"]["coinbase"]["symbols"]
-
-    def _resolve_leadlag_paths(asset):
-        """Return (bn_path, cb_path) for the configured leadlag_source."""
-        if args.leadlag_source == "v4_ticks":
-            asset_short = asset.split("_")[0]   # "btc_usd" -> "btc"
-            bn = os.path.join(args.leadlag_v4_dir, f"{asset_short}_binance_1m.parquet")
-            cb = os.path.join(args.leadlag_v4_dir, f"{asset_short}_coinbase_1m.parquet")
-            return (bn if os.path.exists(bn) else None,
-                    cb if os.path.exists(cb) else None)
-        bn_sym = bn_symbols.get(asset, "").lower()
-        cb_sym = cb_symbols.get(asset, "").lower().replace("-", "_")
-        bn_files = sorted(glob.glob(os.path.join(leadlag_dir, f"binance_{bn_sym}_*.parquet")))
-        cb_files = sorted(glob.glob(os.path.join(leadlag_dir, f"coinbase_{cb_sym}_*.parquet")))
-        return (bn_files[-1] if bn_files else None,
-                cb_files[-1] if cb_files else None)
 
     if args.all:
         pattern = os.path.join(args.features_dir, "features_minute_hyperliquid_*.parquet")
@@ -700,11 +806,17 @@ def main():
             out_path = os.path.join(out_dir, out_name)
 
             # Find matching lead-lag and indicator files
-            bn_path, cb_path = _resolve_leadlag_paths(asset)
+            bn_sym = bn_symbols.get(asset, "").lower()
+            cb_sym = cb_symbols.get(asset, "").lower().replace("-", "_")
+            bn_files = sorted(glob.glob(os.path.join(leadlag_dir, f"binance_{bn_sym}_*.parquet")))
+            cb_files = sorted(glob.glob(os.path.join(leadlag_dir, f"coinbase_{cb_sym}_*.parquet")))
             ind_files = sorted(glob.glob(os.path.join(ind_dir, f"hyperliquid_{asset}_*_indicators.parquet")))
+
+            bn_path = bn_files[-1] if bn_files else None
+            cb_path = cb_files[-1] if cb_files else None
             ind_path = ind_files[-1] if ind_files else None
 
-            build_hl_features(f, out_path, args.config, horizons,
+            build_hl_features(f, out_path, args.config, horizons, cost,
                               ind_path, bn_path, cb_path, asset)
 
     elif args.minute_parquet:
@@ -718,14 +830,17 @@ def main():
         out_name = basename.replace("features_minute_", "xgb_features_")
         out_path = os.path.join(out_dir, out_name)
 
-        bn_path, cb_path = _resolve_leadlag_paths(asset)
+        bn_sym = bn_symbols.get(asset, "").lower()
+        cb_sym = cb_symbols.get(asset, "").lower().replace("-", "_")
+        bn_files = sorted(glob.glob(os.path.join(leadlag_dir, f"binance_{bn_sym}_*.parquet")))
+        cb_files = sorted(glob.glob(os.path.join(leadlag_dir, f"coinbase_{cb_sym}_*.parquet")))
         ind_files = sorted(glob.glob(os.path.join(ind_dir, f"hyperliquid_{asset}_*_indicators.parquet")))
 
         build_hl_features(
-            args.minute_parquet, out_path, args.config, horizons,
+            args.minute_parquet, out_path, args.config, horizons, cost,
             ind_files[-1] if ind_files else None,
-            bn_path,
-            cb_path,
+            bn_files[-1] if bn_files else None,
+            cb_files[-1] if cb_files else None,
             asset,
         )
     else:
