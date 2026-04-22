@@ -321,7 +321,7 @@ PYTHONPATH=src python3 -m ingestion.backfill \
   --end-date $(date +%Y-%m-%d) \
   --max-assets 30 \
   --plan pro \
-  --api-key CG-L7kRMtBZWB7VNHEPVpvvDHZe \
+  --api-key <your-coingecko-api-key> \
   --resume
 ```
 
