@@ -320,7 +320,7 @@ class BacktestGridRunner:
             "errors":            errors[:10],
         }
 
-        self._write_audit(summary)
+        self._write_audit(summary, date=self.end_date)
 
         logger.info(
             "Grid run complete: grid_run_id=%s duration=%.0fs uri=%s",
@@ -419,9 +419,13 @@ class BacktestGridRunner:
         )
         return uri
 
-    def _write_audit(self, summary: dict) -> None:
-        """Write grid run audit log to S3 Gold."""
-        key = f"gold/audit/grid_run_id={self.grid_run_id}/grid_audit.json"
+    def _write_audit(self, summary: dict, *, date: str) -> None:
+        """Write grid run audit log to S3 Gold.
+
+        `date` is the data date (YYYY-MM-DD) — typically the grid's end_date,
+        not wall-clock. Keyword-only to prevent positional-arg confusion.
+        """
+        key = f"gold/audit/date={date}/grid_run_id={self.grid_run_id}/grid_audit.json"
         self._s3.put_object(
             Bucket=self.bucket,
             Key=key,

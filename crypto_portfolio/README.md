@@ -456,7 +456,7 @@ Final analytical outputs. Written by the backtest and simulation engines after e
 gold/backtest/grid_run_id={uuid}/results.parquet    # 432 rows × all metrics
 gold/simulations/run_id={uuid}/stats.parquet        # 18 rows (6 strategies × 3 profiles)
 gold/simulations/run_id={uuid}/paths_sample.parquet # 100 sampled paths for visualization
-gold/audit/run_id={uuid}/audit.parquet              # pipeline run metadata
+gold/audit/date={YYYY-MM-DD}/run_id={uuid}/audit.json  # pipeline run metadata
 ```
 
 ---
