@@ -9,6 +9,7 @@
 # =============================================================================
 
 import json
+import re
 import uuid
 from unittest.mock import MagicMock, patch
 
@@ -216,6 +217,28 @@ class TestBacktestGridRunner:
         runner  = self._make_runner()
         summary = runner.run()
         assert runner._s3.put_object.called
+
+    def test_audit_key_is_date_partitioned(self):
+        runner  = self._make_runner()
+        runner.run()
+
+        audit_calls = [
+            c for c in runner._s3.put_object.call_args_list
+            if "gold/audit/" in c.kwargs.get("Key", "")
+        ]
+        assert len(audit_calls) == 1, (
+            f"Expected exactly one gold/audit/ write, got {len(audit_calls)}: "
+            f"{[c.kwargs.get('Key') for c in audit_calls]}"
+        )
+
+        key = audit_calls[0].kwargs["Key"]
+        # Must land under gold/audit/date=YYYY-MM-DD/grid_run_id=.../grid_audit.json
+        # where the date is the grid's end_date (data date), not wall-clock.
+        pattern = (
+            rf"^gold/audit/date={runner.end_date}/"
+            rf"grid_run_id={runner.grid_run_id}/grid_audit\.json$"
+        )
+        assert re.match(pattern, key), f"Unexpected audit key: {key}"
 
     def test_empty_data_raises(self):
         runner = self._make_runner()

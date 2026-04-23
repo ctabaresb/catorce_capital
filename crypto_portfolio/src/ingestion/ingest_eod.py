@@ -281,7 +281,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             write_result = write_result,
             live_ranks   = live_ranks,
         )
-        writer.write_audit_log(run_id=run_id, audit_data=audit_data)
+        writer.write_audit_log(run_id=run_id, audit_data=audit_data, date=date_str)
 
         # -- Done ----------------------------------------------------------
         logger.info(
