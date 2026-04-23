@@ -83,17 +83,21 @@ def handler(event: dict, context: Any) -> dict:
     s3         = _get_s3()
     bucket     = os.environ.get("DATA_LAKE_BUCKET", "")
     now        = datetime.now(timezone.utc)
-    date_str   = now.strftime("%Y-%m-%d")
     run_id     = event.get("execution_name", f"manual-{now.strftime('%Y%m%dT%H%M%S')}")
     status     = event.get("status", "UNKNOWN")
     started_at = event.get("started_at", now.isoformat())
 
-    # Compute duration
+    # Pipeline start date is the data date for this audit record — it keeps
+    # all three audit writers' records under the same partition even when
+    # the run straddles UTC midnight. Falls back to wall-clock when
+    # started_at is missing or unparseable.
     try:
         start_dt      = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
         duration_secs = (now - start_dt).total_seconds()
+        date_str      = start_dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
     except Exception:
         duration_secs = -1
+        date_str      = now.strftime("%Y-%m-%d")
 
     # Data layer hashes for integrity verification
     data_hashes = {

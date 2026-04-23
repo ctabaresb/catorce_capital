@@ -9,6 +9,7 @@
 # =============================================================================
 
 import json
+import re
 import pytest
 from unittest.mock import MagicMock, patch, call
 
@@ -177,6 +178,14 @@ class TestHandlerSuccess:
         handler(_make_lambda_event(), MagicMock())
 
         mock_writer.write_audit_log.assert_called_once()
+
+        # Audit write must carry the ingest target date so the Gold key lands
+        # under gold/audit/date=YYYY-MM-DD/run_id=.../audit.json.
+        kwargs = mock_writer.write_audit_log.call_args.kwargs
+        assert "date" in kwargs, "write_audit_log must be called with a date kwarg"
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", kwargs["date"])
+        assert "run_id" in kwargs
+        assert "audit_data" in kwargs
 
 
 class TestHandlerFailures:

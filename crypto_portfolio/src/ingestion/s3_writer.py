@@ -180,14 +180,20 @@ class S3Writer:
         self,
         run_id: str,
         audit_data: dict[str, Any],
+        *,
+        date: str,
     ) -> str:
         """
         Write pipeline run audit log to Gold layer.
         Called at the end of every successful Lambda invocation.
 
+        `date` is the ingest target date (YYYY-MM-DD) and determines the
+        Gold partition — kept keyword-only to avoid positional-arg confusion
+        with `run_id`.
+
         Returns the S3 URI of the audit file.
         """
-        key = f"gold/audit/run_id={run_id}/audit.json"
+        key = f"gold/audit/date={date}/run_id={run_id}/audit.json"
         self._put_object(key, json.dumps(audit_data, indent=2).encode())
 
         uri = f"s3://{self.bucket}/{key}"
