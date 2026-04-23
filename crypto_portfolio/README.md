@@ -17,13 +17,15 @@
 9. [Backtesting Engine](#9-backtesting-engine)
 10. [GBM Simulation Engine](#10-gbm-simulation-engine)
 11. [REST API Layer](#11-rest-api-layer)
-12. [Dashboard](#12-dashboard)
-13. [Project File Structure](#13-project-file-structure)
-14. [Script Reference](#14-script-reference)
-15. [Key Technical Decisions](#15-key-technical-decisions)
-16. [Known Limitations](#16-known-limitations)
-17. [Cost Profile](#17-cost-profile)
-18. [Operations Runbook](#18-operations-runbook)
+12. [Dashboard & Hosting](#12-dashboard--hosting)
+13. [Cloudflare Infrastructure](#13-cloudflare-infrastructure)
+14. [Project File Structure](#14-project-file-structure)
+15. [Script Reference](#15-script-reference)
+16. [Key Technical Decisions](#16-key-technical-decisions)
+17. [Known Limitations](#17-known-limitations)
+18. [Cost Profile](#18-cost-profile)
+19. [Production URLs](#19-production-urls)
+20. [Operations Runbook](#20-operations-runbook)
 
 ---
 
@@ -405,10 +407,22 @@ Lambda (ingest_eod) ──────────────► Bronze S3 (raw
 Gold S3
      │
      ▼
-Lambda (api_handler) ◄── API Gateway ◄── Cloudflare Worker ◄── Dashboard (S3/public)
+Lambda (api_handler) ◄── API Gateway ◄── Cloudflare Worker (API proxy)
+                                              ▲
+                                              │
+                                    Cloudflare Worker (static dashboard)
+                                              ▲
+                                              │
+                                    Cloudflare Access (email gate)
+                                              ▲
+                                              │
+                                    catorcelabs.com (Cloudflare DNS)
+                                              ▲
+                                              │
+                                         [Investor]
 ```
 
-All compute is serverless. There are no always-on EC2 instances. ECS runs on Fargate Spot for the heavy jobs (backtest, simulation, transform). The only persistent cost is S3 storage and scheduled Lambda invocations.
+All compute is serverless. There are no always-on EC2 instances. ECS runs on Fargate Spot for the heavy jobs (backtest, simulation, transform). The only persistent cost is S3 storage and scheduled Lambda invocations. The entire frontend layer (DNS, TLS, static hosting, API proxy, access control) runs on Cloudflare's free tier at $0/month.
 
 ---
 
@@ -465,7 +479,7 @@ All infrastructure is managed with OpenTofu (open-source Terraform). State is st
 | API Gateway | j44cjs4ozj | REST API entry point |
 | EventBridge | — | 00:30 UTC ingest, 00:45 UTC transform |
 | SNS | pipeline-alerts | Email alerts on pipeline completion/failure |
-| Secrets Manager | coingecko-api-key | CoinGecko API key (CG- prefix, Basic plan) |
+| Secrets Manager | crypto-platform/dev/coingecko-api-key | CoinGecko API key (CG- prefix, Basic plan) |
 | VPC | Default | Networking for ECS tasks |
 
 ### IAM Role Summary
@@ -626,13 +640,13 @@ A Lambda function behind API Gateway serves all Gold results.
 
 The Lambda uses the AWS SDK for Pandas layer (`AWSSDKPandas-Python312:16`) to avoid bundling pandas/pyarrow in the deployment package. CORS is configured via OPTIONS mock integration in API Gateway.
 
-**Public access via Cloudflare Worker:** For investor-facing deployment, a Cloudflare Worker proxies all requests and injects the API key server-side. The dashboard calls `WORKER_URL/proxy/{path}` and the Worker forwards to API Gateway. Investors never see the API key or AWS URL.
+**Public access via Cloudflare Worker:** The `catorce-api-proxy` Cloudflare Worker proxies all requests and injects the API key server-side. The dashboard calls `WORKER_URL/{path}` (no `/proxy/` prefix) and the Worker forwards to API Gateway with the `x-api-key` header injected from a Cloudflare Secret. Investors never see the API key or AWS URL. The Worker enforces a path allowlist (`/health`, `/strategies`, `/simulations`, `/universe`, `/backtest`), GET-only methods, CORS headers, and 5-minute edge caching.
 
 ---
 
-## 12. Dashboard
+## 12. Dashboard & Hosting
 
-A single standalone HTML file (`dashboard_public.html`) with no build system, no npm, no framework dependencies. Uses Chart.js loaded from CDN.
+A single standalone HTML file (`dashboard_public.html`, deployed as `index.html`) with no build system, no npm, no framework dependencies. Uses Chart.js loaded from CDN.
 
 **Charts:**
 - Strategy comparison bar chart (Sharpe ratio by strategy and profile)
@@ -643,14 +657,72 @@ A single standalone HTML file (`dashboard_public.html`) with no build system, no
 **Features:**
 - Dark/light mode toggle
 - Profile filter (Conservative / Balanced / Aggressive / All)
-- Auto-loads on page open (no manual API key input in public version)
+- Auto-loads on page open (no manual API key input)
 - Fully responsive
+- "live" indicator with timestamp in top right corner
 
-**Deployment:** Upload to S3 with public-read ACL, or any static hosting. The public version calls the Cloudflare Worker URL — no credentials are embedded in the HTML.
+**Hosting:** Deployed as a Cloudflare Static Assets Worker (`catorce-dashboard`). Custom domain `catorcelabs.com` attached via Cloudflare DNS. No S3 public buckets, no CloudFront distribution, no ACM certificates needed. Cloudflare provides free TLS, global CDN (300+ PoPs), and DDoS protection.
+
+**Access control:** Cloudflare Access (Zero Trust, free tier, up to 50 users) gates `catorcelabs.com` behind email-based authentication. Visitors see a login screen, enter their email, receive a 6-digit code, and are granted a 24-hour session. Only emails added to the "Approved investors" policy can access the dashboard. Team name: `catorce-labs`.
+
+**API flow from dashboard:**
+```
+dashboard_public.html (line 202): const WORKER_URL = "https://catorce-api-proxy.carlostabaresb.workers.dev"
+dashboard_public.html (line 205): fetch(WORKER_URL + path)   // e.g. /health, /strategies, /backtest/best
+```
+No `/proxy/` prefix. The Worker forwards the path as-is to API Gateway.
+
+**Updating the dashboard:**
+1. Edit `dashboard_public.html`
+2. `cp dashboard_public.html index.html`
+3. Cloudflare dashboard -> Workers & Pages -> catorce-dashboard -> Deploy -> upload updated folder containing `index.html`
+4. Verify at `https://catorcelabs.com` (may need to clear cache or use incognito)
+
+**Git tags:** `dashboard-v1-poc` marks the first live version. `domain-v1-live` marks the version with `catorcelabs.com` and Cloudflare Access wired up.
 
 ---
 
-## 13. Project File Structure
+## 13. Cloudflare Infrastructure
+
+All frontend infrastructure (DNS, TLS, static hosting, API proxy, access control) runs on Cloudflare's free tier at $0/month. No AWS services are involved in serving the dashboard or managing investor access.
+
+| Resource | Name | Purpose |
+|---|---|---|
+| DNS zone | catorcelabs.com | Domain DNS (nameservers delegated from Squarespace) |
+| Worker | catorce-dashboard | Serves static dashboard HTML on catorcelabs.com |
+| Worker | catorce-api-proxy | API proxy: injects x-api-key, forwards to AWS API Gateway |
+| Worker Secret | `API_KEY` (on catorce-api-proxy) | AWS API Gateway key, injected server-side |
+| Access Application | Catorce Dashboard | Email-gated access to catorcelabs.com, 24h session |
+| Access Policy | Approved investors | Allow list of specific email addresses |
+| Zero Trust team | catorce-labs | Free tier, up to 50 users |
+
+**DNS setup:** Domain registered at Squarespace. Nameservers delegated to Cloudflare (`chase.ns.cloudflare.com`, `frida.ns.cloudflare.com`). Cloudflare manages all DNS records. The Route 53 hosted zone that previously held the domain was deleted after migration.
+
+**Worker security model:**
+```
+[Investor browser] -> catorcelabs.com
+    -> [Cloudflare Access] email gate, 24h session
+    -> [catorce-dashboard worker] serves index.html (no secrets)
+    -> browser JS calls [catorce-api-proxy worker] (holds API_KEY as encrypted secret)
+    -> [AWS API Gateway] with x-api-key injected server-side
+    -> [Lambda] -> [S3 Gold Parquet]
+```
+
+The API key never appears in the browser. The proxy Worker enforces: path allowlist (`/health`, `/strategies`, `/simulations`, `/universe`, `/backtest`), GET-only methods, CORS headers, and 5-minute edge caching.
+
+**Adding a new investor:**
+1. Cloudflare Zero Trust dashboard -> Access -> Applications -> Catorce Dashboard -> edit policy
+2. Add investor email to the "Emails" include rule
+3. Save. No deploy needed. They can log in immediately.
+
+**Rotating the API key:**
+1. Regenerate key in AWS: `cd infra/terraform && tofu output -raw api_key`
+2. Cloudflare dashboard -> Workers & Pages -> catorce-api-proxy -> Settings -> Variables and Secrets -> update `API_KEY`
+3. Redeploy the worker
+
+---
+
+## 14. Project File Structure
 
 ```
 crypto_portfolio/
@@ -700,6 +772,7 @@ crypto_portfolio/
 │
 ├── dashboard.html               # Private dashboard (requires manual API key input)
 ├── dashboard_public.html        # Public dashboard (calls Cloudflare Worker, no key exposed)
+├── index.html                   # Copy of dashboard_public.html (deployed to Cloudflare)
 ├── cloudflare-worker.js         # Cloudflare Worker proxy (injects API key server-side)
 ├── build_and_push.sh            # Builds Docker image and pushes to ECR
 ├── Dockerfile                   # ECS container: Python 3.12, all src/ modules + dependencies
@@ -708,7 +781,7 @@ crypto_portfolio/
 
 ---
 
-## 14. Script Reference
+## 15. Script Reference
 
 ### `src/ingestion/universe.py`
 The single source of truth for the asset universe. Defines `UNIVERSE_SEED` (list of `AssetDefinition`), `RiskTier` and `AssetCategory` enums, `PROFILE_ELIGIBLE_TIERS` mapping, and `UniverseManager` class. The `enrich_records()` method is called by `prices_transform.py` to stamp `in_conservative`, `in_balanced`, `in_aggressive` flags onto every Silver record. **Changing this file and rebuilding Docker is all that is needed to change the universe.**
@@ -762,11 +835,11 @@ Lambda handler called at the end of each Step Functions execution. Reads the lat
 Lambda handler for all REST API endpoints. Uses `boto3` + `pyarrow` (via the AWS SDK for Pandas Lambda layer) to read Gold Parquet files. Always reads the latest `run_id` by listing Gold objects and sorting by `LastModified`. Returns JSON responses with CORS headers. The `/simulations` endpoint reads `stats.parquet` explicitly (not `paths_sample.parquet`).
 
 ### `cloudflare-worker.js`
-Cloudflare Worker that proxies dashboard API calls to API Gateway. Injects the `x-api-key` header from a Cloudflare Secret (never in source code). Routes `/proxy/{path}` → `API_GATEWAY_URL/{path}`. Adds 5-minute cache headers and CORS headers. Returns all responses as JSON.
+Cloudflare Worker deployed as `catorce-api-proxy`. Injects the `x-api-key` header from a Cloudflare Secret (`API_KEY`, never in source code). Routes `/{path}` directly to `API_GATEWAY_URL/{path}` (no `/proxy/` prefix). Only allowlisted paths are forwarded: `/health`, `/strategies`, `/simulations`, `/universe`, `/backtest`. GET-only (returns 405 for all other methods). Adds 5-minute cache headers and CORS headers. No secret logging.
 
 ---
 
-## 15. Key Technical Decisions
+## 16. Key Technical Decisions
 
 **Why ECS instead of Lambda for transform/backtest/simulation?**  
 The pandas + pyarrow + cvxpy dependency bundle exceeds Lambda's 70MB layer limit. ECS Fargate Spot at 0.5 vCPU / 2GB for the transform and 2 vCPU / 8GB for backtest/simulation is cheap (~$0.002-0.02 per run) and has no size constraints.
@@ -784,14 +857,17 @@ With only 1 year of Silver history, an 80% threshold leaves only BTC and ETH eli
 Bronze is written by the Lambda at ingest time. If the universe changes (a coin is added or removed), re-ingesting 365 days of Bronze just to update flags would be expensive and slow. By re-applying flags from `universe.py` in the transform layer, a universe change takes effect immediately on the next transform run without touching Bronze. This is the canonical medallion architecture pattern.
 
 **Why Cloudflare Worker instead of exposing API Gateway directly?**  
-Embedding an API key in HTML is a security risk even if obscured. The Worker stores the key as a Cloudflare Secret and injects it server-side. Investors see only the Worker URL in the dashboard source.
+Embedding an API key in HTML is a security risk even if obscured. The Worker stores the key as a Cloudflare Secret and injects it server-side. Investors see only the Worker URL in the dashboard source. The API key never appears in browser DevTools.
+
+**Why Cloudflare (DNS + hosting + access) instead of CloudFront + S3 + Route 53 + Cognito?**  
+The original plan was to use CloudFront + S3 + ACM + Route 53 for static hosting and Cognito for auth. This was abandoned in favor of Cloudflare because: (a) Cloudflare gives DNS, CDN, TLS, static hosting, API proxy, and access control for $0/month vs $1-5/month on AWS, (b) setup time was 30 minutes vs 4-8 hours, (c) the Worker pattern was already built and verified for the API proxy, so adding static hosting and access control on the same vendor eliminated cross-vendor complexity. Route 53 hosted zone and ACM certificates were deleted after migration.
 
 **Why `lifecycle { prevent_destroy = true }` on the API Gateway key?**  
 `tofu apply` was regenerating the API key on every deployment that touched the API Gateway deployment resource. The lifecycle lock prevents the key resource from ever being destroyed or replaced, so investors with saved keys never need to update them.
 
 ---
 
-## 16. Known Limitations
+## 17. Known Limitations
 
 **1 year of history only**  
 CoinGecko Basic plan caps historical data at 365 days per coin. This means the backtest covers only one market cycle phase. The April 2025 – April 2026 period was one of the worst 12-month periods for altcoins (TAO: -70%, most DeFi tokens: -50 to -70%). Upgrading to CoinGecko Analyst ($129/month) would unlock 5 years of history.
@@ -802,14 +878,19 @@ The GBM simulation runs each strategy/profile combination with equal weights as 
 **Balanced = Aggressive in simulation**  
 Both profiles have 19 eligible assets after the 50% coverage filter because the aggressive-tier coins (TAO, FET, AGIX etc.) all have exactly 365 days of history from the backfill, same as the balanced-tier coins. They naturally differentiate over time as daily data accumulates.
 
+**Dashboard accessible via workers.dev URL without Access gate**  
+The `catorce-dashboard.carlostabaresb.workers.dev` URL serves the same dashboard as `catorcelabs.com` but bypasses the Cloudflare Access gate. This should be restricted or removed before broad distribution. See Outstanding Items.
+
 **Junk coins in Bronze**  
 The daily Lambda fetches the top 20 coins by CoinGecko market cap rank. On any given day, this may include coins not in the curated universe (stablecoins, obscure tokens). These appear in Bronze and Silver but are excluded from all portfolios via the `in_conservative/balanced/aggressive` flags. They do not affect backtest or simulation results.
 
 ---
 
-## 17. Cost Profile
+## 18. Cost Profile
 
 Target: under $250/month.
+
+### AWS costs
 
 | Service | Usage | Estimated Monthly Cost |
 |---|---|---|
@@ -823,13 +904,43 @@ Target: under $250/month.
 | Secrets Manager | 2 secrets | ~$0.80 |
 | ECR | 1 image ~2GB | ~$0.20 |
 | SNS | ~30 emails/month | ~$0.00 |
-| **Total** | | **~$7-12/month** |
+| **AWS Total** | | **~$7-12/month** |
 
-Well under the $250 budget. The main cost driver would be more frequent Step Functions pipeline runs or significantly more S3 data.
+### Cloudflare costs
+
+| Service | Usage | Monthly Cost |
+|---|---|---|
+| DNS (catorcelabs.com) | Free plan | $0.00 |
+| Workers (2 workers) | Free tier: 100k requests/day | $0.00 |
+| Zero Trust Access | Free tier: up to 50 users | $0.00 |
+| TLS certificate | Auto-provisioned | $0.00 |
+| **Cloudflare Total** | | **$0.00** |
+
+### Combined total: ~$7-12/month
+
+Well under the $250 budget. The main cost driver would be more frequent Step Functions pipeline runs or significantly more S3 data. Route 53 hosted zone ($0.50/month) was deleted after migrating DNS to Cloudflare.
 
 ---
 
-## 18. Operations Runbook
+## 19. Production URLs
+
+| Resource | URL / Value |
+|---|---|
+| **Investor dashboard (gated)** | https://catorcelabs.com |
+| Dashboard worker (internal) | https://catorce-dashboard.carlostabaresb.workers.dev |
+| API proxy worker | https://catorce-api-proxy.carlostabaresb.workers.dev |
+| AWS API Gateway | https://j44cjs4ozj.execute-api.us-east-1.amazonaws.com/v1 |
+| AWS account | 454851577001 (us-east-1) |
+| S3 bucket | crypto-platform-catorce |
+| Cloudflare team | catorce-labs |
+| Domain registrar | Squarespace (nameservers delegated to Cloudflare) |
+| Cloudflare nameservers | chase.ns.cloudflare.com, frida.ns.cloudflare.com |
+
+**The investor-facing URL is `https://catorcelabs.com`.** All other URLs are internal infrastructure. Do not share the `*.workers.dev` URLs with investors; the dashboard worker URL bypasses the Access gate.
+
+---
+
+## 20. Operations Runbook
 
 ### Trigger pipeline manually
 ```bash
@@ -916,7 +1027,71 @@ print(coverage.to_string())
 "
 ```
 
+### Full pipeline sanity check (Bronze, Silver, Gold)
+```bash
+# Bronze: last 7 days of ingestion
+aws s3 ls s3://crypto-platform-catorce/bronze/coingecko/markets/ | sort | tail -7
+
+# Silver: last 5 days
+aws s3 ls s3://crypto-platform-catorce/silver/prices/ | sort | tail -5
+aws s3 ls s3://crypto-platform-catorce/silver/returns/ | sort | tail -5
+
+# Gold: latest backtest and simulation outputs
+aws s3 ls s3://crypto-platform-catorce/gold/backtest/ --recursive | sort | tail -5
+aws s3 ls s3://crypto-platform-catorce/gold/simulations/ --recursive | sort | tail -5
+
+# Step Functions: last 3 execution statuses
+aws stepfunctions list-executions \
+  --state-machine-arn "arn:aws:states:us-east-1:454851577001:stateMachine:crypto-platform-dev-pipeline" \
+  --max-results 3 \
+  --query 'executions[*].{name:name,status:status,start:startDate}' \
+  --output table
+```
+
+### Verify dashboard health via Cloudflare Worker
+```bash
+curl -s "https://catorce-api-proxy.carlostabaresb.workers.dev/health" | python3 -m json.tool
+curl -s "https://catorce-api-proxy.carlostabaresb.workers.dev/backtest/best" | python3 -m json.tool
+```
+
+### Add a new investor
+1. Cloudflare Zero Trust dashboard -> Access -> Applications -> Catorce Dashboard -> edit policy
+2. Add investor email to the "Emails" include rule
+3. Save. No deploy needed. They can log in immediately at `https://catorcelabs.com`
+
+### Redeploy dashboard
+```bash
+cd ~/Documents/GitHub/catorce_capital/crypto_portfolio
+# Make changes to dashboard_public.html
+cp dashboard_public.html index.html
+mkdir -p /tmp/catorce-deploy
+cp index.html /tmp/catorce-deploy/
+# Then in Cloudflare: Workers & Pages -> catorce-dashboard -> deploy new version -> upload folder
+```
+
+### Check AWS monthly costs
+```bash
+aws ce get-cost-and-usage \
+  --time-period Start=$(date -v-1m +%Y-%m-01),End=$(date +%Y-%m-01) \
+  --granularity MONTHLY \
+  --metrics UnblendedCost \
+  --group-by Type=DIMENSION,Key=SERVICE \
+  --output table
+```
+
 ---
 
-*Last updated: April 10, 2026*  
-*AWS Account: 454851577001 | Region: us-east-1 | Bucket: crypto-platform-catorce*
+## Outstanding Items
+
+1. **Restrict `catorce-dashboard.carlostabaresb.workers.dev`:** This URL bypasses the Cloudflare Access gate. Either add an Access policy to it or disable direct access so only `catorcelabs.com` works.
+2. **Delete orphan ACM certificate:** An ACM certificate for `catorcelabs.com` in us-east-1 from the abandoned CloudFront setup should be deleted.
+3. **AWS Budget alarm:** Create a $250/month budget with email alerts at 50% threshold.
+4. **Stale Gold cleanup:** Multiple old `grid_run_id` and `run_id` folders accumulate in Gold. Add an S3 lifecycle rule (expire after 90 days) to `gold/backtest/` and `gold/simulations/` via Terraform.
+5. **Dashboard redesign:** Current dashboard is a PoC. Plan a professional redesign with better typography, charts, and mobile layout.
+6. **Investor demo narrative:** Script a 7-minute demo flow with pre-baked answers for `passes_all_criteria=false` and 1-year history limitation.
+
+---
+
+*Last updated: April 18, 2026*  
+*AWS Account: 454851577001 | Region: us-east-1 | Bucket: crypto-platform-catorce*  
+*Domain: catorcelabs.com | Cloudflare team: catorce-labs*
