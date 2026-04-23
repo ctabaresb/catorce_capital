@@ -76,17 +76,17 @@ After universe changes, Bronze-only coins need a backfill to populate historical
 
 `api_handler.py` always serves the latest `run_id` by listing Gold and sorting by `LastModified`, so old runs accumulate until lifecycle rules clean them up.
 
-### Audit layer — three write paths (known inconsistency)
+### Audit layer — three writers, one partition scheme
 
-`gold/audit/` is written by three different code paths with three different layouts. Future cleanup or migration work needs to touch all three:
+`gold/audit/` is written by three different code paths. All three nest under `date=YYYY-MM-DD/` using the **data date** (what the run is about), not wall-clock at write time — this keeps a single pipeline run's three records co-located even when the run straddles UTC midnight. Filenames stay distinct because each writer has a different schema.
 
-| Layout | Writer | Trigger |
-|---|---|---|
-| `gold/audit/run_id={id}/audit.json` | `s3_writer.py:190` (called from `ingest_eod.py`) | every daily ingest at 00:30 UTC |
-| `gold/audit/grid_run_id={id}/grid_audit.json` | `grid_runner.py:424` | every backtest grid run |
-| `gold/audit/date=YYYY-MM-DD/run_id={id}/pipeline_audit.json` | `audit_logger.py:150` | end of every Step Functions execution |
+| Layout | Writer | Trigger | Date source |
+|---|---|---|---|
+| `gold/audit/date={d}/run_id={id}/audit.json` | `s3_writer.write_audit_log` | every daily ingest at 00:30 UTC | ingest target date |
+| `gold/audit/date={d}/grid_run_id={id}/grid_audit.json` | `grid_runner._write_audit` | every backtest grid run | grid `end_date` |
+| `gold/audit/date={d}/run_id={id}/pipeline_audit.json` | `audit_logger.handler` | end of every Step Functions execution | `started_at[:10]` with fallback to `now` |
 
-The flat `run_id=*` and `grid_run_id=*` folders are **steady-state output**, not stale — they regenerate on every daily ingest and every backtest. If you "clean them up" without patching the writers, they'll come back. The date-partitioned layout is the canonical one; consolidating the other two onto it is the right long-term fix.
+Legacy flat-layout objects (`gold/audit/run_id=*/` and `gold/audit/grid_run_id=*/`) from before this was unified remain on S3 untouched — they're compliance-retained and small. No code reads them; lifecycle does not expire them.
 
 ### Frontend / access
 
