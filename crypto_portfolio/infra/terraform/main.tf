@@ -15,17 +15,15 @@ terraform {
   }
 
   # ---------------------------------------------------------------------------
-  # REMOTE STATE (recommended for production)
-  # Uncomment this block once you have an S3 bucket for Terraform state.
-  # On first run, leave commented and use local state, then migrate.
+  # Remote state — bucket + lock table provisioned by infra/terraform/bootstrap.
   # ---------------------------------------------------------------------------
-  # backend "s3" {
-  #   bucket         = "your-terraform-state-bucket"   # replace with your bucket name
-  #   key            = "crypto-platform/terraform.tfstate"
-  #   region         = "us-east-1"
-  #   encrypt        = true
-  #   dynamodb_table = "terraform-state-lock"           # for state locking
-  # }
+  backend "s3" {
+    bucket         = "catorce-crypto-platform-tfstate"
+    key            = "crypto-platform/dev/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "crypto-platform-dev-tfstate-lock"
+  }
 }
 
 provider "aws" {
