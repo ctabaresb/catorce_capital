@@ -199,7 +199,7 @@ const LABELS={
 let currentProfile='all',allStrategies=[],allSims=[];
 let stratChart,scatChart,simChart;
 
-const WORKER_URL = "https://catorce-api-proxy.carlostabaresb.workers.dev"; // e.g. https://catorce-proxy.yourname.workers.dev
+const WORKER_URL = "/api"; // same-origin route on catorcelabs.com; the API proxy Worker is mounted here behind Cloudflare Access
 
 async function apiFetch(path){
   const r=await fetch(WORKER_URL+path);
