@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches-ignore: [main]
+
+env:
+  PYTHONPATH: src
+
+jobs:
+  python-checks:
+    name: Python checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # TODO: also run `ruff format --check .` here.
+      # The codebase has not been reformatted yet, so adding it now
+      # would make CI red on day one. Plan: a follow-up PR titled
+      # "style: reformat codebase with ruff format" will run `ruff
+      # format .` and commit the resulting diff; the next PR after
+      # that adds the format-check step to this workflow.
+      # See the add-ci-baseline PR description for rationale.
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Pytest
+        run: pytest
+
+  # terraform-checks: placeholder for a follow-up PR that adds
+  # `tofu fmt -check` and `tofu validate` against infra/terraform/
+  # and infra/terraform/bootstrap/. Intentionally not defined here
+  # per the CI baseline spec (no AWS credentials, no tofu plan).
