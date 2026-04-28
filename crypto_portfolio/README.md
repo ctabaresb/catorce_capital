@@ -463,7 +463,7 @@ gold/audit/date={YYYY-MM-DD}/run_id={uuid}/audit.json  # pipeline run metadata
 
 ## 5. AWS Infrastructure
 
-All infrastructure is managed with OpenTofu (open-source Terraform). State is stored locally in `infra/terraform/terraform.tfstate` and must never be committed to git.
+All infrastructure is managed with OpenTofu (open-source Terraform). State is stored remotely in S3 bucket `catorce-crypto-platform-tfstate` (key `crypto-platform/dev/terraform.tfstate`, region `us-east-1`) with DynamoDB locking via table `crypto-platform-dev-tfstate-lock`. The backend resources are themselves provisioned by `infra/terraform/bootstrap/`, a small one-shot module with local state. Local `*.tfstate*` files (including the bootstrap module's state) are gitignored and must never be committed.
 
 | Resource | Name | Purpose |
 |---|---|---|

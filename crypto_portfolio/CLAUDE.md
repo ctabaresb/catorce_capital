@@ -35,7 +35,7 @@ pytest src/backtest/tests/test_strategies.py::test_equal_weight -v   # single te
 ./build_layer.sh                              # outputs .build/lambda_deps_layer.zip
 ```
 
-**Infra** — OpenTofu, state lives locally in `infra/terraform/terraform.tfstate` (never commit).
+**Infra** — OpenTofu. State is remote: S3 bucket `catorce-crypto-platform-tfstate`, key `crypto-platform/dev/terraform.tfstate`, region `us-east-1`, locked via DynamoDB table `crypto-platform-dev-tfstate-lock`. The bucket and lock table are themselves provisioned by `infra/terraform/bootstrap/` (a small module that uses local state — chicken-and-egg). Never commit any `*.tfstate*` files; `.gitignore` excludes them.
 
 ```bash
 cd infra/terraform && tofu apply
@@ -98,7 +98,7 @@ Dashboard is a single `dashboard_public.html` (copied to `index.html` for deploy
 - **API Gateway key has `lifecycle { prevent_destroy = true }`** in `infra/terraform/api.tf`. Do not remove — removing it caused investor-key rotation churn previously.
 - **`S3Writer` exposes both `self._client` and `self._s3`** as aliases to the same boto3 client. `backfill.py` references `_s3`; keep the alias.
 - **`backfill.py` Phase 2** builds the price panel from in-memory results (`_build_prices_panel_from_results`), not by re-reading Bronze. The previous re-read path caused a path-mismatch error — don't revert.
-- **Terraform state is local only** (`terraform.tfstate` in `infra/terraform/`). It must never be committed; `.gitignore` already excludes it.
+- **Terraform state is remote** in S3 (`catorce-crypto-platform-tfstate`, key `crypto-platform/dev/terraform.tfstate`) with DynamoDB locking. The bootstrap module at `infra/terraform/bootstrap/` provisions the backend and uses local state itself. Never commit any `*.tfstate*` files; `.gitignore` already excludes them. A pre-migration archive of the old local state lives at `infra/terraform/terraform.tfstate.local-pre-migration` — kept as belt-and-suspenders, gitignored, safe to delete after a few clean apply cycles.
 
 ## Working agreements
 
