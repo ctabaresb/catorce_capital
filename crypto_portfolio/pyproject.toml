@@ -30,3 +30,11 @@ requests-mock = "1.11.0"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[tool.ruff.lint]
+# Minimal "must-pass" ruleset. Ratchet up in follow-up PRs.
+# E9   = syntax errors (pycodestyle)
+# F63  = invalid comparisons (pyflakes)
+# F7   = syntax errors detected by pyflakes
+# F82  = undefined names in __all__
+select = ["E9", "F63", "F7", "F82"]
