@@ -90,7 +90,7 @@ Legacy flat-layout objects (`gold/audit/run_id=*/` and `gold/audit/grid_run_id=*
 
 ### Frontend / access
 
-Dashboard is a single `dashboard_public.html` (copied to `index.html` for deploy), deployed as a Cloudflare Static Assets Worker at `catorcelabs.com`. A second Worker (`catorce-api-proxy`, source in `cloudflare-worker.js`) injects `x-api-key` server-side from a Cloudflare Secret and enforces a GET-only path allowlist (`/health`, `/strategies`, `/simulations`, `/universe`, `/backtest`). The browser never sees the API key. Cloudflare Access (email gate) sits in front of `catorcelabs.com`; the `*.workers.dev` URL currently bypasses it (see §17 Known Limitations).
+Dashboard is a single `dashboard_public.html` (copied to `index.html` for deploy), deployed as a Cloudflare Static Assets Worker at `catorcelabs.com`. A second Worker (`catorce-api-proxy`, source in `cloudflare-worker.js`) is mounted at `catorcelabs.com/api/*` via a Worker Route, injects `x-api-key` server-side from a Cloudflare Secret, enforces a GET-only path allowlist (`/health`, `/strategies`, `/simulations`, `/universe`, `/backtest`), and rejects requests with non-canonical Origin headers. The browser never sees the API key. Cloudflare Access (email gate) sits in front of `catorcelabs.com` and inherits to `/api/*`. The `*.workers.dev` preview URLs are disabled on both Workers — there is no public bypass route.
 
 ## Editing gotchas
 

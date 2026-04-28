@@ -667,10 +667,10 @@ A single standalone HTML file (`dashboard_public.html`, deployed as `index.html`
 
 **API flow from dashboard:**
 ```
-dashboard_public.html (line 202): const WORKER_URL = "https://catorce-api-proxy.carlostabaresb.workers.dev"
-dashboard_public.html (line 205): fetch(WORKER_URL + path)   // e.g. /health, /strategies, /backtest/best
+dashboard_public.html (line 202): const WORKER_URL = "/api"
+dashboard_public.html (line 205): fetch(WORKER_URL + path)   // e.g. /api/health, /api/strategies, /api/backtest/best
 ```
-No `/proxy/` prefix. The Worker forwards the path as-is to API Gateway.
+The Worker is mounted at `catorcelabs.com/api/*` via a Worker Route. It strips the `/api` prefix and forwards the rest as-is to AWS API Gateway. So `catorcelabs.com/api/strategies` → API Gateway `/v1/strategies`. All requests are same-origin from the dashboard, so they inherit the Cloudflare Access session cookie automatically.
 
 **Updating the dashboard:**
 1. Edit `dashboard_public.html`
@@ -701,14 +701,15 @@ All frontend infrastructure (DNS, TLS, static hosting, API proxy, access control
 **Worker security model:**
 ```
 [Investor browser] -> catorcelabs.com
-    -> [Cloudflare Access] email gate, 24h session
+    -> [Cloudflare Access] email gate, 24h session (covers / and /api/*)
     -> [catorce-dashboard worker] serves index.html (no secrets)
-    -> browser JS calls [catorce-api-proxy worker] (holds API_KEY as encrypted secret)
+    -> browser JS calls /api/<path>  (same-origin, inherits Access cookie)
+    -> [catorce-api-proxy worker] mounted at catorcelabs.com/api/* via Worker Route
     -> [AWS API Gateway] with x-api-key injected server-side
     -> [Lambda] -> [S3 Gold Parquet]
 ```
 
-The API key never appears in the browser. The proxy Worker enforces: path allowlist (`/health`, `/strategies`, `/simulations`, `/universe`, `/backtest`), GET-only methods, CORS headers, and 5-minute edge caching.
+The API key never appears in the browser. The proxy Worker enforces: path allowlist (`/health`, `/strategies`, `/simulations`, `/universe`, `/backtest`), GET-only methods, Origin allowlist (`https://catorcelabs.com`), and 5-minute edge caching. The `*.workers.dev` preview URLs are disabled on both Workers, so the only reachable entry point is the Access-gated `catorcelabs.com` zone.
 
 **Adding a new investor:**
 1. Cloudflare Zero Trust dashboard -> Access -> Applications -> Catorce Dashboard -> edit policy
@@ -878,9 +879,6 @@ The GBM simulation runs each strategy/profile combination with equal weights as 
 **Balanced = Aggressive in simulation**  
 Both profiles have 19 eligible assets after the 50% coverage filter because the aggressive-tier coins (TAO, FET, AGIX etc.) all have exactly 365 days of history from the backfill, same as the balanced-tier coins. They naturally differentiate over time as daily data accumulates.
 
-**Dashboard accessible via workers.dev URL without Access gate**  
-The `catorce-dashboard.carlostabaresb.workers.dev` URL serves the same dashboard as `catorcelabs.com` but bypasses the Cloudflare Access gate. This should be restricted or removed before broad distribution. See Outstanding Items.
-
 **Junk coins in Bronze**  
 The daily Lambda fetches the top 20 coins by CoinGecko market cap rank. On any given day, this may include coins not in the curated universe (stablecoins, obscure tokens). These appear in Bronze and Silver but are excluded from all portfolios via the `in_conservative/balanced/aggressive` flags. They do not affect backtest or simulation results.
 
@@ -927,16 +925,15 @@ Well under the $250 budget. The main cost driver would be more frequent Step Fun
 | Resource | URL / Value |
 |---|---|
 | **Investor dashboard (gated)** | https://catorcelabs.com |
-| Dashboard worker (internal) | https://catorce-dashboard.carlostabaresb.workers.dev |
-| API proxy worker | https://catorce-api-proxy.carlostabaresb.workers.dev |
-| AWS API Gateway | https://j44cjs4ozj.execute-api.us-east-1.amazonaws.com/v1 |
+| API proxy mount (Access-gated) | https://catorcelabs.com/api/* |
+| AWS API Gateway (upstream) | https://j44cjs4ozj.execute-api.us-east-1.amazonaws.com/v1 |
 | AWS account | 454851577001 (us-east-1) |
 | S3 bucket | crypto-platform-catorce |
 | Cloudflare team | catorce-labs |
 | Domain registrar | Squarespace (nameservers delegated to Cloudflare) |
 | Cloudflare nameservers | chase.ns.cloudflare.com, frida.ns.cloudflare.com |
 
-**The investor-facing URL is `https://catorcelabs.com`.** All other URLs are internal infrastructure. Do not share the `*.workers.dev` URLs with investors; the dashboard worker URL bypasses the Access gate.
+**The investor-facing URL is `https://catorcelabs.com`.** The Workers' `*.workers.dev` preview URLs have been disabled, so the only reachable entry point is the Access-gated `catorcelabs.com` zone. The AWS API Gateway URL still requires an `x-api-key` header and should not be shared.
 
 ---
 
@@ -1049,10 +1046,18 @@ aws stepfunctions list-executions \
 ```
 
 ### Verify dashboard health via Cloudflare Worker
+The `/api/*` route is Access-gated, so a raw `curl` without an Access session cookie will be redirected to the login page. Two debug paths:
+
+**Easiest — authenticated browser:** open `https://catorcelabs.com/api/health` and `https://catorcelabs.com/api/backtest/best` in the same browser session you're already logged into; you'll see raw JSON.
+
+**Scripted — bypass Access by hitting AWS API Gateway directly with the key:**
 ```bash
-curl -s "https://catorce-api-proxy.carlostabaresb.workers.dev/health" | python3 -m json.tool
-curl -s "https://catorce-api-proxy.carlostabaresb.workers.dev/backtest/best" | python3 -m json.tool
+API_KEY=$(cd infra/terraform && tofu output -raw api_key)
+UPSTREAM="https://j44cjs4ozj.execute-api.us-east-1.amazonaws.com/v1"
+curl -s -H "x-api-key: ${API_KEY}" "${UPSTREAM}/health" | python3 -m json.tool
+curl -s -H "x-api-key: ${API_KEY}" "${UPSTREAM}/backtest/best" | python3 -m json.tool
 ```
+This skips the Worker entirely and verifies the upstream API. To verify the Worker layer specifically (path allowlist, Origin check, prefix stripping), use the authenticated-browser path.
 
 ### Add a new investor
 1. Cloudflare Zero Trust dashboard -> Access -> Applications -> Catorce Dashboard -> edit policy
@@ -1083,12 +1088,11 @@ aws ce get-cost-and-usage \
 
 ## Outstanding Items
 
-1. **Restrict `catorce-dashboard.carlostabaresb.workers.dev`:** This URL bypasses the Cloudflare Access gate. Either add an Access policy to it or disable direct access so only `catorcelabs.com` works.
-2. **Delete orphan ACM certificate:** An ACM certificate for `catorcelabs.com` in us-east-1 from the abandoned CloudFront setup should be deleted.
-3. **AWS Budget alarm:** Create a $250/month budget with email alerts at 50% threshold.
-4. **Stale Gold cleanup:** Multiple old `grid_run_id` and `run_id` folders accumulate in Gold. Add an S3 lifecycle rule (expire after 90 days) to `gold/backtest/` and `gold/simulations/` via Terraform.
-5. **Dashboard redesign:** Current dashboard is a PoC. Plan a professional redesign with better typography, charts, and mobile layout.
-6. **Investor demo narrative:** Script a 7-minute demo flow with pre-baked answers for `passes_all_criteria=false` and 1-year history limitation.
+1. **Delete orphan ACM certificate:** An ACM certificate for `catorcelabs.com` in us-east-1 from the abandoned CloudFront setup should be deleted.
+2. **AWS Budget alarm:** Create a $250/month budget with email alerts at 50% threshold.
+3. **Stale Gold cleanup:** Multiple old `grid_run_id` and `run_id` folders accumulate in Gold. Add an S3 lifecycle rule (expire after 90 days) to `gold/backtest/` and `gold/simulations/` via Terraform.
+4. **Dashboard redesign:** Current dashboard is a PoC. Plan a professional redesign with better typography, charts, and mobile layout.
+5. **Investor demo narrative:** Script a 7-minute demo flow with pre-baked answers for `passes_all_criteria=false` and 1-year history limitation.
 
 ---
 
