@@ -57,7 +57,7 @@ aws secretsmanager get-secret-value \
 
 **Bronze / Silver / Gold medallion on S3** (`crypto-platform-catorce`). All compute is serverless: Lambda for ingest / API / audit; ECS Fargate Spot for transform, backtest, and simulation (pandas + pyarrow + cvxpy exceed Lambda's layer limit). One Docker image backs every ECS task; the task definition chooses the entrypoint via `containerOverrides`.
 
-**Daily schedule:** EventBridge fires the ingest Lambda at 00:30 UTC, then the transform ECS task at 00:45 UTC. Step Functions orchestrates the full weekly/on-demand run.
+**Daily schedule:** EventBridge rule `crypto-platform-dev-pipeline-schedule` fires the full Step Functions pipeline (Ingest → Transform → Backtest → Simulate → Audit) at 00:30 UTC every day. A second rule `crypto-platform-dev-transform-schedule` re-runs the transform ECS task standalone at 00:45 UTC daily — this is currently redundant with the pipeline's own transform step and is a known cleanup item.
 
 ### The universe is the source of truth for portfolio eligibility
 
