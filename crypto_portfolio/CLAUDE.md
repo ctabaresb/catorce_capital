@@ -107,3 +107,11 @@ Dashboard is a single `dashboard_public.html` (copied to `index.html` for deploy
 - Never run live trades or production deploys without explicit confirmation in the prompt.
 - Ask before introducing new patterns. Match existing code style unless you propose a change and I approve it.
 - Decimals for money. Never float for prices, weights, or fees.
+
+## CI and git rituals
+
+This repo is a "Python project nested inside a larger git repo" layout: the actual git root is `/Users/carlos/Documents/GitHub/catorce_capital/`, one level above `crypto_portfolio/`. Most of the time the project subdirectory acts as the working root, but a few things (notably GitHub Actions) require the actual repo root. Mistakes here have already cost a debugging session — these rules exist so they don't again.
+
+- **After merging a PR via the GitHub UI, always `git checkout main && git pull origin main` before creating any new branch.** Otherwise the new branch is based on stale local main and silently misses whatever just landed (CI workflow files, infra changes, anything). The next PR off that stale branch then surfaces inconsistencies that look like bugs but are just missed merges.
+- **GitHub Actions workflow files MUST live at `.github/workflows/*.yml` from the actual repo root, not from `crypto_portfolio/.github/workflows/`.** Workflows nested inside any subdirectory are silently ignored — they appear in the file tree but never trigger. The workflow file uses `defaults.run.working-directory: crypto_portfolio` so its steps execute from the project subdir, and `cache-dependency-path: crypto_portfolio/requirements.txt` because that path is resolved relative to the workspace (repo) root. When editing the workflow, do it from the actual repo root, not from the project subdir.
+- **Before adding a required status check to branch protection (Ruleset or legacy), verify the workflow has produced at least one successful run on `main`.** If the workflow is missing, broken, or misnamed, a required-check rule creates a chicken-and-egg lock: every PR is blocked waiting for a check that can never appear. Resolution then requires either bypassing the rule (which solo dev "Do not allow bypassing" intentionally makes hard), temporarily removing the rule, or merging a fix-PR that doesn't go through the same check — a much bigger lift than just verifying first.
