@@ -50,6 +50,16 @@ output "step_functions_role_arn" {
   value       = aws_iam_role.step_functions.arn
 }
 
+output "github_actions_deploy_role_arn" {
+  description = "IAM role ARN assumed by .github/workflows/deploy.yml via OIDC. Paste into the workflow's role-to-assume input."
+  value       = aws_iam_role.github_actions_deploy.arn
+}
+
+output "github_actions_oidc_provider_arn" {
+  description = "ARN of the GitHub Actions OIDC provider. Reusable by future workflows."
+  value       = aws_iam_openid_connect_provider.github_actions.arn
+}
+
 output "pipeline_alerts_topic_arn" {
   description = "SNS topic ARN for pipeline failure alerts."
   value       = aws_sns_topic.pipeline_alerts.arn
