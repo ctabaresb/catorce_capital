@@ -14,9 +14,13 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
+
+from datetime import datetime, timezone, timedelta
 
 from simulation.sim_runner import (
-    _load_backtest_weights, CANONICAL_SIM_FEE, CANONICAL_SIM_FREQUENCY,
+    _load_backtest_weights, _get_latest_backtest_key,
+    CANONICAL_SIM_FEE, CANONICAL_SIM_FREQUENCY,
 )
 
 
@@ -171,3 +175,68 @@ class TestLoadBacktestWeights:
         )
         called_key = s3.get_object.call_args.kwargs["Key"]
         assert called_key == "gold/backtest/grid_run_id=abc-123/weights.parquet"
+
+
+# ---------------------------------------------------------------------------
+# _get_latest_backtest_key regression
+# ---------------------------------------------------------------------------
+
+class TestGetLatestBacktestKey:
+
+    def test_ignores_weights_parquet_even_when_newer(self):
+        # Production scenario: gold/backtest/grid_run_id=*/ has BOTH
+        # results.parquet and weights.parquet. grid_runner writes weights.parquet
+        # AFTER results.parquet, so weights.parquet has a later LastModified.
+        # A bare .endswith(".parquet") filter would pick weights.parquet,
+        # causing sim_runner to load weight-shaped rows into df_bt and crash
+        # at the winsorized filter. The helper MUST return the results path.
+        results_key = "gold/backtest/grid_run_id=abc-123/results.parquet"
+        weights_key = "gold/backtest/grid_run_id=abc-123/weights.parquet"
+        params_key  = "gold/backtest/grid_run_id=abc-123/weights_params.json"
+
+        now = datetime.now(timezone.utc)
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {
+            "Contents": [
+                {"Key": results_key, "LastModified": now - timedelta(seconds=10)},
+                {"Key": weights_key, "LastModified": now - timedelta(seconds=5)},   # newer
+                {"Key": params_key,  "LastModified": now - timedelta(seconds=1)},   # newest, not parquet
+            ]
+        }
+
+        key = _get_latest_backtest_key(bucket="b", s3=s3)
+        assert key == results_key
+
+    def test_picks_most_recent_results_across_multiple_grid_runs(self):
+        # Several grid runs accumulate over time; pick the most recently written
+        # results.parquet across them. Weights files from any run must be ignored.
+        now = datetime.now(timezone.utc)
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {
+            "Contents": [
+                {"Key": "gold/backtest/grid_run_id=old/results.parquet",
+                 "LastModified": now - timedelta(days=2)},
+                {"Key": "gold/backtest/grid_run_id=old/weights.parquet",
+                 "LastModified": now - timedelta(days=2)},
+                {"Key": "gold/backtest/grid_run_id=new/results.parquet",
+                 "LastModified": now - timedelta(hours=1)},
+                {"Key": "gold/backtest/grid_run_id=new/weights.parquet",
+                 "LastModified": now - timedelta(minutes=30)},  # newest overall, must NOT be picked
+            ]
+        }
+        key = _get_latest_backtest_key(bucket="b", s3=s3)
+        assert key == "gold/backtest/grid_run_id=new/results.parquet"
+
+    def test_raises_when_no_results_parquet_exists(self):
+        # Edge case: only weights.parquet present (e.g., partial write or bug
+        # upstream). Helper must fail loudly rather than silently return the
+        # weights file.
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {
+            "Contents": [
+                {"Key": "gold/backtest/grid_run_id=x/weights.parquet",
+                 "LastModified": datetime.now(timezone.utc)},
+            ]
+        }
+        with pytest.raises(ValueError, match="No Gold backtest results found"):
+            _get_latest_backtest_key(bucket="b", s3=s3)

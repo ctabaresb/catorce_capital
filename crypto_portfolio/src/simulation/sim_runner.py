@@ -121,10 +121,15 @@ def _load_backtest_weights(
 
 
 def _get_latest_backtest_key(bucket: str, s3) -> str:
-    """Get the most recently written Gold backtest results key."""
+    """Get the most recently written Gold backtest results key.
+
+    Filters to /results.parquet specifically — gold/backtest/grid_run_id=*/
+    now also contains weights.parquet, written AFTER results.parquet, so a
+    bare .parquet filter would pick the weights file (wrong shape for df_bt).
+    """
     resp = s3.list_objects_v2(Bucket=bucket, Prefix="gold/backtest/")
     keys = sorted(
-        [o["Key"] for o in resp.get("Contents", []) if o["Key"].endswith(".parquet")],
+        [o["Key"] for o in resp.get("Contents", []) if o["Key"].endswith("/results.parquet")],
         key=lambda k: resp["Contents"][[o["Key"] for o in resp["Contents"]].index(k)]["LastModified"],
     )
     if not keys:
