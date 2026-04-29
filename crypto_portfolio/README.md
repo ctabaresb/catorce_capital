@@ -481,12 +481,28 @@ All infrastructure is managed with OpenTofu (open-source Terraform). State is st
 | SNS | pipeline-alerts | Email alerts on pipeline completion/failure |
 | Secrets Manager | crypto-platform/dev/coingecko-api-key | CoinGecko API key (CG- prefix, Basic plan) |
 | VPC | Default | Networking for ECS tasks |
+| OIDC provider | token.actions.githubusercontent.com | Trust anchor for GitHub Actions deploys |
+| IAM role | crypto-platform-dev-github-actions-deploy | Assumed by `deploy.yml` via OIDC; ECR push only |
 
 ### IAM Role Summary
 - `lambda-ingest`: S3 write to bronze/*, gold/audit/*
 - `ecs-task`: S3 read from bronze/silver, write to silver/gold
 - `step-functions`: Lambda invoke, ECS RunTask, SNS publish, PassRole
 - `eventbridge-invoke`: Lambda InvokeFunction + states:StartExecution + ECS RunTask
+- `monitor-lambda`: S3 ListBucket on `gold/{backtest,simulations}/*`, CloudWatch PutMetricData on `Catorce/Pipeline`, SNS Publish to pipeline-alerts
+- `github-actions-deploy`: ECR push (BatchCheckLayer/Upload/PutImage) on the backtest-engine repo only; no ECS/S3/Lambda/PassRole
+
+### GitHub Actions OIDC trust binding
+
+The `github-actions-deploy` IAM role's assume-role policy is scoped exactly to:
+
+```
+repo:ctabaresb/catorce_capital:ref:refs/heads/main
+```
+
+No wildcards. This means only workflows running on the `main` branch of this exact repository can assume the role — feature-branch workflows, fork PRs, and other repos cannot.
+
+**Maintenance gotcha — repo rename or transfer.** If the GitHub repo is renamed (`catorce_capital` → something else) or transferred to a different owner (`ctabaresb` → another account), the `sub` claim in `infra/terraform/oidc.tf` must be updated **before or in the same change** as the git operation. Otherwise the deploy workflow silently fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity` on every run, and the daily ECS pipeline keeps running against the last successfully-pushed image. The deploy workflow's `pipeline-step-functions-failed` alarm will eventually catch any divergence between merged code and ECR contents, but the lag is up to 24 hours — fix the trust binding proactively.
 
 ---
 
