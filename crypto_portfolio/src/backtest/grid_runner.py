@@ -95,6 +95,37 @@ GOLD_RESULTS_SCHEMA = pa.schema([
     pa.field("avg_n_assets",           pa.float64()),
 ])
 
+# Long-format weights sidecar. One row per (run_id, coin_id). Joins to
+# GOLD_RESULTS_SCHEMA on run_id (1:2 fan-out — both winsorized rows share
+# the same run_id and the same weights). rebalancing_frequency and
+# round_trip_fee are kept here so the data is self-describing without
+# needing to reference sim_runner.py code to know which canonical cell
+# downstream consumers select.
+GOLD_WEIGHTS_SCHEMA = pa.schema([
+    pa.field("run_id",                 pa.string()),
+    pa.field("grid_run_id",            pa.string()),
+    pa.field("strategy_id",            pa.string()),
+    pa.field("profile",                pa.string()),
+    pa.field("rebalancing_frequency",  pa.string()),
+    pa.field("round_trip_fee",         pa.float64()),
+    pa.field("coin_id",                pa.string()),
+    pa.field("weight",                 pa.float64()),
+    pa.field("weight_as_of_date",      pa.string()),
+])
+
+# Canonical (fee, frequency) cell that sim_runner reads. Documented in the
+# weights_params.json sidecar so future readers see the convention next to
+# the data, not buried in code.
+CANONICAL_SIM_FEE       = 0.001
+CANONICAL_SIM_FREQUENCY = "monthly"
+CANONICAL_SIM_RATIONALE = (
+    "0.1% round-trip approximates realistic Hyperliquid spot execution "
+    "(~0.072% maker-only to ~0.126% taker-only; mixed in practice ~0.1%). "
+    "Monthly rebalancing is the production-recommended cadence. "
+    "Fixed canonical cell avoids in-sample selection bias from picking the "
+    "best (strategy, profile) cell post-hoc."
+)
+
 
 # ---------------------------------------------------------------------------
 # Single backtest worker
@@ -137,18 +168,42 @@ def run_single_backtest(
             row["grid_run_id"] = grid_run_id
             rows.append(row)
 
+        # Extract latest-rebalance weights — the portfolio composition an
+        # investor following this strategy would actually hold today. Skip
+        # the cell entirely if the strategy returned empty at every rebalance
+        # (a logged edge case in rebalancing.py:240) so weights_history is empty.
+        weights = []
+        wh = result.weight_history
+        if not wh.empty:
+            latest_date = wh["date"].max()
+            latest      = wh[wh["date"] == latest_date]
+            as_of_str   = pd.Timestamp(latest_date).strftime("%Y-%m-%d")
+            for _, w_row in latest.iterrows():
+                weights.append({
+                    "run_id":                run_id,
+                    "grid_run_id":           grid_run_id,
+                    "strategy_id":           config.strategy_id.value,
+                    "profile":               config.profile.value,
+                    "rebalancing_frequency": config.rebalancing_frequency.value,
+                    "round_trip_fee":        config.round_trip_fee,
+                    "coin_id":               w_row["coin_id"],
+                    "weight":                float(w_row["weight"]),
+                    "weight_as_of_date":     as_of_str,
+                })
+
         logger.debug(
             "Completed: strategy=%s profile=%s freq=%s fee=%.3f "
-            "sharpe=%.3f cagr=%.3f",
+            "sharpe=%.3f cagr=%.3f weights=%d",
             config.strategy_id.value,
             config.profile.value,
             config.rebalancing_frequency.value,
             config.round_trip_fee,
             rows[0].get("sharpe_ratio", 0),
             rows[0].get("cagr", 0),
+            len(weights),
         )
 
-        return {"run_id": run_id, "rows": rows, "error": None}
+        return {"run_id": run_id, "rows": rows, "weights": weights, "error": None}
 
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {str(exc)}"
@@ -160,9 +215,10 @@ def run_single_backtest(
             error_msg,
         )
         return {
-            "run_id": run_id,
-            "rows":   [],
-            "error":  error_msg,
+            "run_id":  run_id,
+            "rows":    [],
+            "weights": [],
+            "error":   error_msg,
             "config": {
                 "strategy_id":          config.strategy_id.value,
                 "profile":              config.profile.value,
@@ -262,6 +318,7 @@ class BacktestGridRunner:
 
         # -- Step 4: Execute in parallel -----------------------------------
         all_rows    = []
+        all_weights = []
         errors      = []
         completed   = 0
 
@@ -287,6 +344,7 @@ class BacktestGridRunner:
                     errors.append(result)
                 else:
                     all_rows.extend(result["rows"])
+                    all_weights.extend(result["weights"])
 
                 if completed % 20 == 0:
                     logger.info(
@@ -295,13 +353,15 @@ class BacktestGridRunner:
                     )
 
         logger.info(
-            "Grid complete: total=%d success=%d errors=%d result_rows=%d",
+            "Grid complete: total=%d success=%d errors=%d result_rows=%d weight_rows=%d",
             len(configs), len(configs) - len(errors),
-            len(errors), len(all_rows),
+            len(errors), len(all_rows), len(all_weights),
         )
 
         # -- Step 5: Write results to S3 Gold ------------------------------
-        gold_uri = self._write_gold_results(all_rows)
+        gold_uri    = self._write_gold_results(all_rows)
+        weights_uri = self._write_gold_weights(all_weights)
+        params_uri  = self._write_weights_params(weights_as_of=self.end_date)
 
         # -- Step 6: Write audit log ---------------------------------------
         run_end  = datetime.now(timezone.utc)
@@ -315,7 +375,10 @@ class BacktestGridRunner:
             "successful":        len(configs) - len(errors),
             "failed":            len(errors),
             "result_rows":       len(all_rows),
+            "weight_rows":       len(all_weights),
             "gold_uri":          gold_uri,
+            "weights_uri":       weights_uri,
+            "weights_params_uri": params_uri,
             "duration_seconds":  round(duration, 1),
             "errors":            errors[:10],
         }
@@ -417,6 +480,61 @@ class BacktestGridRunner:
             "Wrote Gold results: rows=%d bytes=%d uri=%s",
             len(df), len(buffer.getvalue()), uri,
         )
+        return uri
+
+    def _write_gold_weights(self, weight_rows: list[dict]) -> str:
+        """Write the long-format weights sidecar to S3 Gold."""
+        if not weight_rows:
+            logger.warning(
+                "No weight rows to write — every backtest cell had empty weight history."
+            )
+            return ""
+
+        df = pd.DataFrame(weight_rows)[
+            [f.name for f in GOLD_WEIGHTS_SCHEMA]
+        ]
+
+        table  = pa.Table.from_pandas(df, schema=GOLD_WEIGHTS_SCHEMA, safe=False)
+        buffer = io.BytesIO()
+        pq.write_table(table, buffer, compression="snappy", write_statistics=True)
+        buffer.seek(0)
+
+        key = f"gold/backtest/grid_run_id={self.grid_run_id}/weights.parquet"
+        self._s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=buffer.getvalue(),
+            ContentType="application/octet-stream",
+        )
+
+        uri = f"s3://{self.bucket}/{key}"
+        logger.info(
+            "Wrote Gold weights: rows=%d bytes=%d uri=%s",
+            len(df), len(buffer.getvalue()), uri,
+        )
+        return uri
+
+    def _write_weights_params(self, weights_as_of: str) -> str:
+        """Document the canonical (fee, frequency) cell sim_runner reads.
+        Co-located with weights.parquet so future readers see the convention."""
+        params = {
+            "canonical_sim_cell": {
+                "round_trip_fee":        CANONICAL_SIM_FEE,
+                "rebalancing_frequency": CANONICAL_SIM_FREQUENCY,
+            },
+            "rationale":      CANONICAL_SIM_RATIONALE,
+            "weights_as_of":  weights_as_of,
+            "schema_version": 1,
+        }
+        key = f"gold/backtest/grid_run_id={self.grid_run_id}/weights_params.json"
+        self._s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=json.dumps(params, indent=2).encode(),
+            ContentType="application/json",
+        )
+        uri = f"s3://{self.bucket}/{key}"
+        logger.info("Wrote weights_params: %s", uri)
         return uri
 
     def _write_audit(self, summary: dict, *, date: str) -> None:

@@ -270,3 +270,25 @@ class TestSimulationStats:
         weights = pd.Series({c: 1/3 for c in engine.coin_ids_})
         stats   = SimulationStats().compute(result, weights)
         assert stats["max_drawdown"]["max"] <= 0.01  # at most tiny positive due to floating point
+
+    def test_different_weights_produce_different_stats(self):
+        # Headline correctness check. Pre-fix, sim_runner used equal weight for
+        # every (strategy, profile) cell, so all sim outputs were identical.
+        # This test verifies the math is weight-sensitive — concentrating in
+        # different assets must produce different distributional stats.
+        result, engine = self._run_simulation(n_sims=100, horizon=90)
+        coins          = engine.coin_ids_
+        assert len(coins) >= 2, "Need at least 2 coins to differentiate weights"
+
+        weights_first = pd.Series([1.0] + [0.0] * (len(coins) - 1), index=coins)
+        weights_last  = pd.Series([0.0] * (len(coins) - 1) + [1.0], index=coins)
+
+        stats_first = SimulationStats().compute(result, weights_first)
+        stats_last  = SimulationStats().compute(result, weights_last)
+
+        # CAGR p50 must differ — concentrating in distinct assets with
+        # distinct mu/sigma drives different median outcomes.
+        assert stats_first["cagr"]["p50"] != stats_last["cagr"]["p50"]
+        # Final-value p50 must differ — distinct expected returns drive
+        # distinct medians of the terminal portfolio value.
+        assert stats_first["final_value"]["p50"] != stats_last["final_value"]["p50"]
