@@ -721,6 +721,14 @@ The API key never appears in the browser. The proxy Worker enforces: path allowl
 2. Cloudflare dashboard -> Workers & Pages -> catorce-api-proxy -> Settings -> Variables and Secrets -> update `API_KEY`
 3. Redeploy the worker
 
+**Security verification:** the `*.workers.dev` bypass closure can be re-verified anytime with a single curl from any unauthenticated terminal:
+
+```bash
+curl -s -o /dev/null -w "HTTP %{http_code}\n" https://catorcelabs.com/api/health
+```
+
+Expected: `HTTP 302` (redirect to the Cloudflare Access login). `HTTP 200` with a JSON body would mean the bypass has reopened — the most likely root causes are the `*.workers.dev` preview URL being re-enabled on `catorce-api-proxy`, the `catorcelabs.com/api/*` Worker Route having been deleted, or the Access app's path scope being narrowed away from `/api/*`. Last verified: 2026-04-28 via the 4-URL incognito sweep documented in the `harden-cloudflare-worker` PR.
+
 ---
 
 ## 14. Project File Structure
