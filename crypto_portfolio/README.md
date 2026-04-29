@@ -963,6 +963,41 @@ aws stepfunctions list-executions \
   --output table
 ```
 
+### Monitoring & alarms
+
+Three CloudWatch alarms watch the pipeline, all routing to the `pipeline_alerts` SNS topic (subscribed at `carlostabaresb@gmail.com`):
+
+| Alarm | What it catches | Trigger |
+|---|---|---|
+| `crypto-platform-dev-pipeline-step-functions-failed` | Pipeline ran and a stage failed | `AWS/States ExecutionsFailed > 0` over 24h |
+| `crypto-platform-dev-pipeline-step-functions-not-started` | Pipeline never started (EventBridge/IAM regression) | `AWS/States ExecutionsStarted < 1` over 24h, missing data = breaching |
+| `crypto-platform-dev-pipeline-gold-partition-stale` | State machine exited 0 but produced no fresh Gold output | Custom `Catorce/Pipeline / GoldPartitionFreshness < 1` over 24h, missing data = breaching |
+
+The freshness alarm is driven by a synthetic-check Lambda (`crypto-platform-dev-gold-freshness-check`) on its own EventBridge schedule at **02:00 UTC daily** — independent of the Step Functions pipeline so it can detect total-failure cases. It lists today's `gold/backtest/` and `gold/simulations/` partitions and emits `1` only if both are fresh.
+
+**Check current alarm states:**
+```bash
+aws cloudwatch describe-alarms \
+  --alarm-names \
+    crypto-platform-dev-pipeline-step-functions-failed \
+    crypto-platform-dev-pipeline-step-functions-not-started \
+    crypto-platform-dev-pipeline-gold-partition-stale \
+  --query 'MetricAlarms[].{Name:AlarmName,State:StateValue,Reason:StateReason}' \
+  --output table
+```
+
+**Re-seed the freshness metric** (after first deploy of the alarm, or to recover from a transient `ALARM` once the underlying issue is fixed):
+```bash
+aws lambda invoke \
+  --function-name crypto-platform-dev-gold-freshness-check \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{}' \
+  /tmp/seed-response.json && cat /tmp/seed-response.json
+```
+Expected: `{"statusCode": 200, "metric_value": 1, ...}`. If `metric_value` is `0`, the `results` field names which prefix is stale — investigate before silencing.
+
+**Negative-path test (verify alarms still fire):** rename or move a recent `gold/backtest/grid_run_id={uuid}/` object to a temp prefix, re-invoke the Lambda, and expect `metric_value: 0` and the gold-partition-stale alarm to transition `OK → ALARM` within ~5 min. Restore the object and re-invoke to clear.
+
 ### Check Silver flags for today
 ```bash
 PYTHONPATH=src python3 -c "
