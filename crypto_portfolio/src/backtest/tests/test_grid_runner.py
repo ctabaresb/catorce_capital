@@ -23,6 +23,8 @@ from backtest.config import (
 )
 from backtest.grid_runner import (
     BacktestGridRunner, run_single_backtest,
+    GOLD_WEIGHTS_SCHEMA,
+    CANONICAL_SIM_FEE, CANONICAL_SIM_FREQUENCY,
 )
 
 
@@ -150,6 +152,64 @@ class TestRunSingleBacktest:
         assert result["error"] is not None
         assert result["rows"] == []
 
+    def test_returns_weights_with_expected_keys(self):
+        cfg = BacktestConfig(
+            strategy_id=StrategyId.EQUAL_WEIGHT,
+            profile=PortfolioProfile.BALANCED,
+            rebalancing_frequency=RebalancingFrequency.MONTHLY,
+        )
+        result = run_single_backtest(
+            config=cfg,
+            df_returns=_make_returns_df(),
+            df_prices=_make_prices_df(),
+            benchmark_returns=_make_benchmark(),
+            grid_run_id="test-grid",
+        )
+        assert "weights" in result
+        assert len(result["weights"]) > 0
+        expected_keys = {f.name for f in GOLD_WEIGHTS_SCHEMA}
+        for w_row in result["weights"]:
+            assert set(w_row.keys()) == expected_keys
+            assert w_row["strategy_id"] == "equal_weight"
+            assert w_row["profile"] == "balanced"
+            assert w_row["rebalancing_frequency"] == "monthly"
+
+    def test_weights_share_run_id_with_metric_rows(self):
+        # Critical join contract: both winsorized result rows AND every weight
+        # row must share the same run_id, so a join fans 1 weight -> 2 metrics
+        # cleanly without ambiguity.
+        cfg = BacktestConfig(
+            strategy_id=StrategyId.EQUAL_WEIGHT,
+            profile=PortfolioProfile.BALANCED,
+            rebalancing_frequency=RebalancingFrequency.MONTHLY,
+        )
+        result = run_single_backtest(
+            config=cfg,
+            df_returns=_make_returns_df(),
+            df_prices=_make_prices_df(),
+            benchmark_returns=_make_benchmark(),
+            grid_run_id="test-grid",
+        )
+        run_ids_metrics = {r["run_id"] for r in result["rows"]}
+        run_ids_weights = {w["run_id"] for w in result["weights"]}
+        assert len(run_ids_metrics) == 1
+        assert run_ids_weights == run_ids_metrics
+
+    def test_weights_empty_when_error(self):
+        cfg = BacktestConfig(
+            strategy_id=StrategyId.EQUAL_WEIGHT,
+            profile=PortfolioProfile.BALANCED,
+            rebalancing_frequency=RebalancingFrequency.MONTHLY,
+        )
+        result = run_single_backtest(
+            config=cfg,
+            df_returns=pd.DataFrame(),
+            df_prices=pd.DataFrame(),
+            benchmark_returns=pd.Series(dtype=float),
+            grid_run_id="test-grid",
+        )
+        assert result["weights"] == []
+
     def test_grid_run_id_in_rows(self):
         cfg = BacktestConfig(
             strategy_id=StrategyId.EQUAL_WEIGHT,
@@ -239,6 +299,42 @@ class TestBacktestGridRunner:
             rf"grid_run_id={runner.grid_run_id}/grid_audit\.json$"
         )
         assert re.match(pattern, key), f"Unexpected audit key: {key}"
+
+    def test_writes_weights_sidecar(self):
+        runner = self._make_runner()
+        runner.run()
+        weights_calls = [
+            c for c in runner._s3.put_object.call_args_list
+            if c.kwargs.get("Key", "").endswith("/weights.parquet")
+        ]
+        assert len(weights_calls) == 1, (
+            f"Expected exactly one weights.parquet write, got {len(weights_calls)}"
+        )
+        key = weights_calls[0].kwargs["Key"]
+        assert key == f"gold/backtest/grid_run_id={runner.grid_run_id}/weights.parquet"
+
+    def test_writes_weights_params_with_canonical_cell(self):
+        runner = self._make_runner()
+        runner.run()
+        params_calls = [
+            c for c in runner._s3.put_object.call_args_list
+            if c.kwargs.get("Key", "").endswith("/weights_params.json")
+        ]
+        assert len(params_calls) == 1
+        body = json.loads(params_calls[0].kwargs["Body"])
+        assert body["canonical_sim_cell"]["round_trip_fee"] == CANONICAL_SIM_FEE
+        assert body["canonical_sim_cell"]["rebalancing_frequency"] == CANONICAL_SIM_FREQUENCY
+        assert "rationale" in body
+        assert body["schema_version"] == 1
+
+    def test_summary_reports_weight_counts(self):
+        runner  = self._make_runner()
+        summary = runner.run()
+        assert "weight_rows" in summary
+        assert "weights_uri" in summary
+        assert "weights_params_uri" in summary
+        # Each combo with non-empty weight history contributes len(coins) rows
+        assert summary["weight_rows"] > 0
 
     def test_empty_data_raises(self):
         runner = self._make_runner()
