@@ -30,6 +30,12 @@ from simulation.gbm_simulator import (
     SimulationStats, SimulationWriter,
 )
 
+# Canonical (fee, frequency) cell that sim_runner reads from weights.parquet.
+# Justification lives in gold/backtest/grid_run_id=*/weights_params.json — see
+# CANONICAL_SIM_RATIONALE in src/backtest/grid_runner.py.
+CANONICAL_SIM_FEE       = 0.001
+CANONICAL_SIM_FREQUENCY = "monthly"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -49,6 +55,69 @@ def _load_silver(bucket: str, prefix: str, s3) -> pd.DataFrame:
                 dfs.append(pq.read_table(io.BytesIO(raw["Body"].read())).to_pandas())
     logger.info("Loaded %d partitions from %s", len(dfs), prefix)
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+def _load_backtest_weights(
+    bucket: str,
+    backtest_key: str,
+    s3,
+) -> dict[tuple[str, str], pd.Series]:
+    """
+    Load per-(strategy, profile) weights from the canonical (fee, frequency)
+    cell of the backtest weights sidecar. Returns an empty dict if the
+    sidecar is missing — callers fall back to equal weight in that case.
+
+    Canonical cell = round_trip_fee=0.001 + rebalancing_frequency='monthly'.
+    """
+    weights_key = backtest_key.replace("/results.parquet", "/weights.parquet")
+
+    try:
+        raw = s3.get_object(Bucket=bucket, Key=weights_key)
+    except s3.exceptions.NoSuchKey:
+        logger.warning(
+            "No weights sidecar at %s — sim will fall back to equal weight "
+            "for all (strategy, profile) combos.",
+            weights_key,
+        )
+        return {}
+    except Exception as exc:
+        # ClientError 404 surfaces as a generic exception in some boto3 paths.
+        if "NoSuchKey" in str(exc) or "404" in str(exc):
+            logger.warning(
+                "No weights sidecar at %s — sim will fall back to equal weight.",
+                weights_key,
+            )
+            return {}
+        raise
+
+    df = pq.read_table(io.BytesIO(raw["Body"].read())).to_pandas()
+
+    canonical = df[
+        (df["round_trip_fee"] == CANONICAL_SIM_FEE) &
+        (df["rebalancing_frequency"] == CANONICAL_SIM_FREQUENCY)
+    ]
+
+    if canonical.empty:
+        logger.warning(
+            "Weights sidecar found but no rows match canonical cell "
+            "(fee=%s, freq=%s). All combos will fall back to equal weight.",
+            CANONICAL_SIM_FEE, CANONICAL_SIM_FREQUENCY,
+        )
+        return {}
+
+    weights: dict[tuple[str, str], pd.Series] = {}
+    for (strategy_id, profile), group in canonical.groupby(["strategy_id", "profile"]):
+        weights[(strategy_id, profile)] = pd.Series(
+            group["weight"].values,
+            index=group["coin_id"].values,
+        )
+
+    logger.info(
+        "Loaded backtest weights: %d (strategy, profile) combos from canonical cell "
+        "(fee=%s, freq=%s)",
+        len(weights), CANONICAL_SIM_FEE, CANONICAL_SIM_FREQUENCY,
+    )
+    return weights
 
 
 def _get_latest_backtest_key(bucket: str, s3) -> str:
@@ -104,12 +173,16 @@ def main() -> None:
 
     logger.info("Backtest results: %d rows, %d strategies", len(df_bt), df_bt["strategy_id"].nunique())
 
+    # ---- Step 2b: Load canonical-cell weights from the sidecar --------------
+    backtest_weights = _load_backtest_weights(args.bucket, backtest_key, s3)
+
     # ---- Step 3: Fit correlation engine per profile -------------------------
     profiles = ["conservative", "balanced", "aggressive"]
     if args.profile_filter:
         profiles = [p for p in profiles if p in args.profile_filter.split(",")]
 
-    all_stats = []
+    all_stats      = []
+    weights_audit  = {}  # (strategy_id, profile) -> "loaded_from_backtest" | "fallback_equal_weight"
 
     for profile in profiles:
         logger.info("Processing profile: %s", profile)
@@ -173,26 +246,29 @@ def main() -> None:
             # Run GBM simulation
             sim_result = grid.run(df_prices=df_p, config=config)
 
-            # Get representative weights from backtest (best Sharpe for this combo)
-            bt_subset = df_bt[
-                (df_bt["strategy_id"] == strategy_id) &
-                (df_bt["profile"]     == profile)
-            ]
-
-            if bt_subset.empty:
-                logger.warning(
-                    "No backtest results for %s/%s. Using equal weight.",
-                    strategy_id, profile,
+            # Pull canonical-cell weights from the sidecar; equal-weight fallback
+            # if absent. Reindex to the engine's eligible coins (zero-fill missing,
+            # drop weights for coins that were dropped by coverage threshold).
+            combo_key = (strategy_id, profile)
+            if combo_key in backtest_weights:
+                weights = (
+                    backtest_weights[combo_key]
+                    .reindex(engine.coin_ids_)
+                    .fillna(0.0)
                 )
-                n = len(engine.coin_ids_)
-                weights = pd.Series(
-                    {c: 1.0/n for c in engine.coin_ids_}
+                weights_audit[f"{strategy_id}/{profile}"] = "loaded_from_backtest"
+                logger.info(
+                    "Using backtest weights for %s/%s: %d non-zero / %d eligible coins",
+                    strategy_id, profile,
+                    int((weights > 0).sum()), len(engine.coin_ids_),
                 )
             else:
-                # Use equal weight as representative (weights not stored in Gold yet)
                 n = len(engine.coin_ids_)
-                weights = pd.Series(
-                    {c: 1.0/n for c in engine.coin_ids_}
+                weights = pd.Series({c: 1.0/n for c in engine.coin_ids_})
+                weights_audit[f"{strategy_id}/{profile}"] = "fallback_equal_weight"
+                logger.warning(
+                    "Falling back to equal weight for %s/%s (no canonical-cell row in sidecar).",
+                    strategy_id, profile,
                 )
 
             # Compute stats distribution
@@ -218,14 +294,44 @@ def main() -> None:
 
     stats_uri = writer.write_stats(all_stats, run_id)
 
+    # Audit trail: which (strategy, profile) combos got real backtest weights
+    # vs. equal-weight fallback. Co-located with sim outputs so a future reader
+    # can see the weight provenance without reading sim_runner code.
+    audit_payload = {
+        "grid_run_id":   backtest_key.split("grid_run_id=")[-1].split("/")[0]
+                         if "grid_run_id=" in backtest_key else None,
+        "canonical_cell": {
+            "round_trip_fee":        CANONICAL_SIM_FEE,
+            "rebalancing_frequency": CANONICAL_SIM_FREQUENCY,
+        },
+        "per_combo": weights_audit,
+        "fallback_count": sum(1 for v in weights_audit.values() if v == "fallback_equal_weight"),
+        "loaded_count":   sum(1 for v in weights_audit.values() if v == "loaded_from_backtest"),
+    }
+    audit_key = f"gold/simulations/run_id={run_id}/weights_audit.json"
+    s3.put_object(
+        Bucket=args.bucket,
+        Key=audit_key,
+        Body=json.dumps(audit_payload, indent=2).encode(),
+        ContentType="application/json",
+    )
+    audit_uri = f"s3://{args.bucket}/{audit_key}"
+    logger.info(
+        "Wrote weights audit: loaded=%d fallback=%d uri=%s",
+        audit_payload["loaded_count"], audit_payload["fallback_count"], audit_uri,
+    )
+
     summary = {
-        "run_id":         run_id,
-        "n_combinations": len(all_stats),
-        "n_simulations":  args.n_simulations,
-        "horizon_days":   args.horizon_days,
-        "profiles":       profiles,
-        "stats_uri":      stats_uri,
-        "completed_at":   datetime.now(timezone.utc).isoformat(),
+        "run_id":            run_id,
+        "n_combinations":    len(all_stats),
+        "n_simulations":     args.n_simulations,
+        "horizon_days":      args.horizon_days,
+        "profiles":          profiles,
+        "stats_uri":         stats_uri,
+        "weights_audit_uri": audit_uri,
+        "weights_loaded":    audit_payload["loaded_count"],
+        "weights_fallback":  audit_payload["fallback_count"],
+        "completed_at":      datetime.now(timezone.utc).isoformat(),
     }
 
     logger.info("Simulation grid complete: %s", json.dumps(summary, indent=2))
