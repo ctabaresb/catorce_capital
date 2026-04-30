@@ -155,13 +155,30 @@ jobs:
           # Pull the container's stdout/stderr from CloudWatch and surface it on
           # the workflow run page. Useful for fast triage if smoke ever fails —
           # see the intermediate validation state, not just exit code.
+          #
+          # If log retrieval fails (IAM regression, CloudWatch eventual
+          # consistency, etc.) the workflow continues — the smoke pass/fail
+          # signal is the container exit code, not log presence. We surface
+          # the failure as a yellow ::warning:: annotation on the run page so
+          # future-you sees triage data is missing without re-running the
+          # entire deploy.
           LOG_STREAM="backtest/${CONTAINER_NAME}/${TASK_ID}"
           echo "===== Smoke task log (CloudWatch ${ECS_LOG_GROUP}/${LOG_STREAM}) ====="
-          aws logs get-log-events \
+          set +e
+          LOG_OUTPUT=$(aws logs get-log-events \
             --log-group-name "${ECS_LOG_GROUP}" \
             --log-stream-name "${LOG_STREAM}" \
             --query 'events[].message' \
-            --output text || echo "(log stream not yet available)"
+            --output text 2>&1)
+          LOG_EXIT=$?
+          set -e
+          if [ $LOG_EXIT -eq 0 ]; then
+            echo "${LOG_OUTPUT}"
+          else
+            echo "::warning title=Smoke log retrieval failed::Could not fetch smoke task logs from CloudWatch (exit ${LOG_EXIT}). Smoke pass/fail is determined by container exit code; workflow continues."
+            echo "::warning::AWS error: ${LOG_OUTPUT}"
+            echo "::warning::Investigate via CloudWatch directly: log group ${ECS_LOG_GROUP}, stream ${LOG_STREAM}"
+          fi
           echo "===== End smoke task log ====="
 
           if [ "${EXIT_CODE}" != "0" ]; then
