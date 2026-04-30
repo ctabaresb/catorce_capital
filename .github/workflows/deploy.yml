@@ -1,0 +1,173 @@
+# =============================================================================
+# .github/workflows/deploy.yml
+#
+# Builds the ECS Docker image, pushes it to ECR, and runs a Fargate smoke
+# test against the just-pushed :sha-<commit> tag. Replaces the manual
+# ./build_and_push.sh step from the deploy path so merging to main = ECR
+# in sync with main HEAD within ~2-6 min.
+#
+# Triggers:
+#   - push to main, only when paths that affect the image change
+#   - workflow_dispatch from main, for force-rebuilds (e.g., refresh stale
+#     GHA cache, re-deploy without a code change)
+#
+# IAM:
+#   Assumes role crypto-platform-dev-github-actions-deploy via OIDC. The
+#   trust policy is scoped exactly to ref:refs/heads/main — feature branches
+#   and fork PRs cannot assume.
+#
+# Network values for the smoke task are hardcoded; source of truth is
+# `tofu output subnet_ids` and `tofu output ecs_security_group_id` in
+# infra/terraform/network.tf. If the default VPC subnets or the ecs_tasks
+# security group change, update the env block below.
+# =============================================================================
+
+name: Deploy ECS image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crypto_portfolio/src/**'
+      - 'crypto_portfolio/Dockerfile'
+      - 'crypto_portfolio/requirements-ecs.txt'
+      - 'crypto_portfolio/build_and_push.sh'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+concurrency:
+  group: deploy-ecs-image
+  cancel-in-progress: false   # serialize, do not drop deploys
+
+env:
+  AWS_REGION:    us-east-1
+  ECR_REGISTRY:  454851577001.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPO:      crypto-platform-dev-backtest-engine
+  ROLE_TO_ASSUME: arn:aws:iam::454851577001:role/crypto-platform-dev-github-actions-deploy
+  ECS_CLUSTER:    crypto-platform-dev
+  ECS_TASK_DEF:   crypto-platform-dev-backtest
+  CONTAINER_NAME: backtest-engine
+  ECS_LOG_GROUP:  /ecs/crypto-platform-dev-backtest
+  # Source: `tofu output subnet_ids` (network.tf:58)
+  SMOKE_SUBNETS:  subnet-01436e9a9a13023d3,subnet-01cef6dc8e174b097,subnet-0071dccc91507d49d,subnet-0f614aa5d7c26e15d,subnet-02060965fb75b4e6d,subnet-014abbd8b265cc67c
+  # Source: `tofu output ecs_security_group_id` (network.tf:63)
+  SMOKE_SG:       sg-0fc6cfe22d9ec95ad
+
+jobs:
+  build-push-smoke:
+    name: Build, push, smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: crypto_portfolio
+          file: crypto_portfolio/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- Smoke test on Fargate ----------------------------------------
+      # Runs the existing crypto-platform-dev-backtest task definition with a
+      # container override invoking `sim_runner.py --smoke-test`. The task
+      # def references :latest, so under Option 1 (push-then-smoke) the
+      # smoke pulls the just-pushed image. We capture the structured JSON
+      # output from the task's CloudWatch logs and surface it on the
+      # workflow run page for fast triage.
+      - name: Run smoke test on Fargate
+        id: smoke
+        run: |
+          set -euo pipefail
+
+          OVERRIDES=$(cat <<EOF
+          {
+            "containerOverrides": [
+              {
+                "name": "${CONTAINER_NAME}",
+                "command": ["python", "-m", "simulation.sim_runner", "--smoke-test"]
+              }
+            ]
+          }
+          EOF
+          )
+
+          NETWORK="awsvpcConfiguration={subnets=[${SMOKE_SUBNETS}],securityGroups=[${SMOKE_SG}],assignPublicIp=ENABLED}"
+
+          echo "Starting smoke task on cluster=${ECS_CLUSTER} task-def=${ECS_TASK_DEF}"
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "${ECS_CLUSTER}" \
+            --task-definition "${ECS_TASK_DEF}" \
+            --launch-type FARGATE \
+            --network-configuration "${NETWORK}" \
+            --overrides "${OVERRIDES}" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          if [ -z "${TASK_ARN}" ] || [ "${TASK_ARN}" = "None" ]; then
+            echo "::error::ecs run-task did not return a task ARN"
+            exit 1
+          fi
+
+          TASK_ID=$(echo "${TASK_ARN}" | awk -F/ '{print $NF}')
+          echo "Smoke task running: ${TASK_ARN}"
+          echo "task_id=${TASK_ID}" >> "$GITHUB_OUTPUT"
+
+          echo "Waiting for task to stop (timeout ~10 min)..."
+          aws ecs wait tasks-stopped --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}"
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "${ECS_CLUSTER}" \
+            --tasks "${TASK_ARN}" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+          STOPPED_REASON=$(aws ecs describe-tasks \
+            --cluster "${ECS_CLUSTER}" \
+            --tasks "${TASK_ARN}" \
+            --query 'tasks[0].stoppedReason' \
+            --output text)
+
+          echo "Smoke task stopped: exit_code=${EXIT_CODE} reason=${STOPPED_REASON}"
+
+          # Pull the container's stdout/stderr from CloudWatch and surface it on
+          # the workflow run page. Useful for fast triage if smoke ever fails —
+          # see the intermediate validation state, not just exit code.
+          LOG_STREAM="backtest/${CONTAINER_NAME}/${TASK_ID}"
+          echo "===== Smoke task log (CloudWatch ${ECS_LOG_GROUP}/${LOG_STREAM}) ====="
+          aws logs get-log-events \
+            --log-group-name "${ECS_LOG_GROUP}" \
+            --log-stream-name "${LOG_STREAM}" \
+            --query 'events[].message' \
+            --output text || echo "(log stream not yet available)"
+          echo "===== End smoke task log ====="
+
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "::error::Smoke test failed (exit ${EXIT_CODE}, reason: ${STOPPED_REASON})"
+            echo "::error::Investigate via CloudWatch: ${ECS_LOG_GROUP} stream ${LOG_STREAM}"
+            exit 1
+          fi
+
+          echo "Smoke test passed."
