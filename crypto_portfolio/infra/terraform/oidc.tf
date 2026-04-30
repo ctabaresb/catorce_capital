@@ -164,3 +164,30 @@ resource "aws_iam_role_policy" "github_actions_deploy_smoke" {
     ]
   })
 }
+
+# ---------------------------------------------------------------------------
+# 5. CloudWatch Logs read for the smoke task's stdout/stderr
+#    deploy.yml fetches the smoke task's log stream after the task stops
+#    so the structured-JSON validation summary surfaces on the workflow
+#    run page. The first deploy-pipeline run failed this step with
+#    AccessDeniedException because the role had no logs:* permissions.
+#
+#    Scoped to the one ECS log group we care about. logs:GetLogEvents is
+#    the only action used — DescribeLogStreams is not needed because the
+#    workflow constructs the stream name deterministically from the task
+#    ID (backtest/<container>/<task-id>) rather than listing streams.
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "github_actions_deploy_logs" {
+  name = "logs-read-smoke-task"
+  role = aws_iam_role.github_actions_deploy.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "GetSmokeTaskLogEvents"
+      Effect   = "Allow"
+      Action   = "logs:GetLogEvents"
+      Resource = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/${var.project_name}-${var.environment}-backtest:log-stream:*"
+    }]
+  })
+}
