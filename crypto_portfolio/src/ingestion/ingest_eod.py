@@ -89,16 +89,14 @@ def _load_config() -> dict[str, Any]:
         "api_key":        cg_secret["api_key"],
         "plan":           cg_secret.get("plan", "free"),
         "bucket":         os.environ["DATA_LAKE_BUCKET"],
-        "universe_size":  int(os.environ.get("UNIVERSE_SIZE", 100)),
         "region":         os.environ["AWS_REGION"],
         "sns_topic_arn":  os.environ.get("SNS_TOPIC_ARN", ""),
         **pipeline_secret,
     }
 
     logger.info(
-        "Config loaded: plan=%s universe_size=%d bucket=%s",
+        "Config loaded: plan=%s bucket=%s",
         _CONFIG_CACHE["plan"],
-        _CONFIG_CACHE["universe_size"],
         _CONFIG_CACHE["bucket"],
     )
 
@@ -196,23 +194,13 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return _error_response(run_id, date_str, msg, status=500)
 
         # -- Step 5: Fetch markets data ------------------------------------
-        universe_size = config["universe_size"]
-        logger.info("Fetching markets: top %d assets", universe_size)
+        # Fetch the curated universe by ID rather than top-N by market cap.
+        # include_excluded=True keeps stablecoins (USDT/USDC/DAI) in the
+        # response so global market data and benchmark logic stay intact.
+        universe_ids = UNIVERSE.get_all_coin_ids(include_excluded=True)
+        logger.info("Fetching markets: %d universe IDs", len(universe_ids))
 
-        markets_payload = client.get_markets(
-            page=1,
-            per_page=min(universe_size, 250),  # CoinGecko max per page
-        )
-
-        # If universe_size > 250, fetch additional pages
-        if universe_size > 250:
-            page = 2
-            while len(markets_payload["data"]) < universe_size:
-                next_page = client.get_markets(page=page, per_page=250)
-                if not next_page["data"]:
-                    break
-                markets_payload["data"].extend(next_page["data"])
-                page += 1
+        markets_payload = client.get_markets(ids=universe_ids)
 
         logger.info(
             "Fetched %d asset records from CoinGecko",
@@ -220,7 +208,11 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         )
 
         # -- Step 6: Validate ----------------------------------------------
-        expected_universe = UNIVERSE.get_expected_validation_set(max_rank=universe_size)
+        # Tolerant validation: require coins with max_mcap_rank <= 50 to be
+        # present (default). Validator halts only if > 5 of those are
+        # missing (validator.MAX_MISSING_ASSETS_BEFORE_HALT) — guards
+        # against CoinGecko outages without flapping on transient gaps.
+        expected_universe = UNIVERSE.get_expected_validation_set()
         valid_records, batch_result = validate_markets_response(
             payload=markets_payload,
             expected_universe=expected_universe,
@@ -372,9 +364,9 @@ def _build_audit(
         "duration_seconds": (run_end - run_start).total_seconds(),
         "pipeline_stage":   "ingestion",
         "config": {
-            "coingecko_plan":  config.get("plan"),
-            "universe_size":   config.get("universe_size"),
-            "bucket":          config.get("bucket"),
+            "coingecko_plan":    config.get("plan"),
+            "universe_id_count": len(UNIVERSE.get_all_coin_ids(include_excluded=True)),
+            "bucket":            config.get("bucket"),
         },
         "validation": {
             "total_received":  batch_result.total_received,

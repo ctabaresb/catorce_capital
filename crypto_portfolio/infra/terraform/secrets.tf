@@ -54,7 +54,6 @@ resource "aws_secretsmanager_secret_version" "pipeline_config" {
   secret_id = aws_secretsmanager_secret.pipeline_config.id
 
   secret_string = jsonencode({
-    universe_size           = var.universe_size
     data_lake_bucket        = var.data_lake_bucket_name
     coingecko_plan          = var.coingecko_plan
     # Rate limits per plan (calls per minute)
