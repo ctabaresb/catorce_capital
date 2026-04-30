@@ -434,7 +434,7 @@ The data lake follows the **Bronze / Silver / Gold medallion architecture** in a
 Raw, unmodified data from CoinGecko. Never overwritten after first write. Serves as the audit trail and allows re-processing Silver without re-fetching from the API.
 
 ```
-bronze/coingecko/markets/date=YYYY-MM-DD/raw.json.gz      # daily top-20 market data
+bronze/coingecko/markets/date=YYYY-MM-DD/raw.json.gz      # daily curated-universe market data
 bronze/coingecko/history/coin_id={id}/date=YYYY-MM-DD/data.json.gz  # per-coin history cache
 ```
 
@@ -511,7 +511,7 @@ No wildcards. This means only workflows running on the `main` branch of this exa
 Two independent schedules run every day automatically:
 
 **00:30 UTC — EventBridge → Lambda ingest_eod**
-Fetches top 20 coins by market cap from CoinGecko `/coins/markets` endpoint. Enriches with universe flags. Writes to Bronze. Takes ~30 seconds.
+Fetches the curated universe (defined in `src/ingestion/universe.py`) from CoinGecko `/coins/markets` using the `ids` parameter. Enriches with universe flags. Writes to Bronze. Takes ~30 seconds.
 
 **00:45 UTC — EventBridge → ECS transform_runner**
 Reads today's Bronze, applies universe classification from `universe.py`, computes log returns, writes Silver prices and returns. Takes ~60-90 seconds. Runs as a separate ECS task (not Lambda) because the pandas + pyarrow dependency bundle exceeds Lambda's 70MB layer limit.
@@ -755,7 +755,7 @@ crypto_portfolio/
 │   ├── ingestion/
 │   │   ├── universe.py          # Asset universe (SINGLE SOURCE OF TRUTH for portfolio eligibility)
 │   │   ├── coingecko_client.py  # CoinGecko API wrapper with rate limiting
-│   │   ├── ingest_eod.py        # Lambda handler: daily top-20 market fetch
+│   │   ├── ingest_eod.py        # Lambda handler: daily curated-universe market fetch
 │   │   ├── backfill.py          # Historical backfill: fetches per-coin daily history
 │   │   ├── s3_writer.py         # S3 write utilities (Bronze and Silver)
 │   │   └── validator.py         # Data quality checks on ingested records
@@ -903,8 +903,8 @@ The GBM simulation runs each strategy/profile combination with equal weights as 
 **Balanced = Aggressive in simulation**  
 Both profiles have 19 eligible assets after the 50% coverage filter because the aggressive-tier coins (TAO, FET, AGIX etc.) all have exactly 365 days of history from the backfill, same as the balanced-tier coins. They naturally differentiate over time as daily data accumulates.
 
-**Junk coins in Bronze**  
-The daily Lambda fetches the top 20 coins by CoinGecko market cap rank. On any given day, this may include coins not in the curated universe (stablecoins, obscure tokens). These appear in Bronze and Silver but are excluded from all portfolios via the `in_conservative/balanced/aggressive` flags. They do not affect backtest or simulation results.
+**Simulation coverage lag for newly-added universe coins**  
+When a new coin is added to `universe.py`, it appears in daily Silver immediately but won't participate in GBM simulation until it accumulates ~196 days of returns (50% of the Silver coverage window). For the current universe, all 27 coins will be eligible after ~6 months. The simulation already discloses this via `weights_audit.json` showing `loaded_count` per profile.
 
 ---
 

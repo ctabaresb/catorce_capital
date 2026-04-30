@@ -293,6 +293,39 @@ class TestCoinGeckoClient:
         assert result["page"] == 1
         assert "fetched_at" in result
 
+    def test_get_markets_with_ids_sends_comma_joined_param(self):
+        config = _make_config()
+        client = CoinGeckoClient(config)
+        mock_data = _mock_markets_response()
+
+        with req_mock.Mocker() as m:
+            m.get(
+                "https://api.coingecko.com/api/v3/coins/markets",
+                json=mock_data,
+                status_code=200,
+            )
+            client.get_markets(ids=["bitcoin", "ethereum", "solana"])
+            sent_query = m.last_request.qs
+
+        # requests-mock normalises query keys to lowercase and values to lists
+        assert sent_query["ids"] == ["bitcoin,ethereum,solana"]
+
+    def test_get_markets_without_ids_omits_param(self):
+        config = _make_config()
+        client = CoinGeckoClient(config)
+        mock_data = _mock_markets_response()
+
+        with req_mock.Mocker() as m:
+            m.get(
+                "https://api.coingecko.com/api/v3/coins/markets",
+                json=mock_data,
+                status_code=200,
+            )
+            client.get_markets(page=1, per_page=2)
+            sent_query = m.last_request.qs
+
+        assert "ids" not in sent_query
+
     def test_ping_returns_true_on_success(self):
         config = _make_config()
         client = CoinGeckoClient(config)

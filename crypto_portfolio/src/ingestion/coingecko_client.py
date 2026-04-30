@@ -91,9 +91,18 @@ class CoinGeckoClient:
     # Public methods
     # -------------------------------------------------------------------------
 
-    def get_markets(self, page: int = 1, per_page: int | None = None) -> dict:
+    def get_markets(
+        self,
+        page: int = 1,
+        per_page: int | None = None,
+        ids: list[str] | None = None,
+    ) -> dict:
         """
-        Fetch current market data for top N assets by market cap.
+        Fetch current market data from CoinGecko /coins/markets.
+
+        When `ids` is provided, the response is filtered to that set of
+        CoinGecko IDs (comma-joined). When omitted, returns the top N
+        coins by market cap (legacy behavior, retained for backfill use).
 
         Returns raw API response dict with added metadata:
         {
@@ -117,13 +126,15 @@ class CoinGeckoClient:
             "locale": "en",
             "precision": "full",
         }
+        if ids:
+            params["ids"] = ",".join(ids)
 
         raw_response, checksum = self._get("/coins/markets", params=params)
         data = json.loads(raw_response)
 
         logger.info(
-            "get_markets: page=%d per_page=%d returned=%d assets checksum=%s",
-            page, per_page, len(data), checksum[:8]
+            "get_markets: page=%d per_page=%d ids=%d returned=%d assets checksum=%s",
+            page, per_page, len(ids) if ids else 0, len(data), checksum[:8]
         )
 
         return {

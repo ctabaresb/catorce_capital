@@ -75,7 +75,6 @@ def _make_mock_config() -> dict:
         "api_key":        "test-api-key",
         "plan":           "free",
         "bucket":         "crypto-platform-catorce",
-        "universe_size":  20,
         "region":         "us-east-1",
         "sns_topic_arn":  "arn:aws:sns:us-east-1:123456789:alerts",
         "rate_limit_per_min": 30,
@@ -101,6 +100,9 @@ class TestHandlerSuccess:
     ):
         # Make universe validation pass for any records we send
         mock_universe.get_expected_validation_set.return_value = set()
+        mock_universe.get_all_coin_ids.return_value = [
+            "bitcoin", "ethereum", "solana", "cardano", "avalanche-2",
+        ]
         mock_universe.enrich_records.side_effect = lambda records: records
 
         mock_load_config.return_value = _make_mock_config()
@@ -157,6 +159,9 @@ class TestHandlerSuccess:
         self, mock_universe, mock_alert, mock_cg_class, mock_writer_class, mock_load_config
     ):
         mock_universe.get_expected_validation_set.return_value = set()
+        mock_universe.get_all_coin_ids.return_value = [
+            "bitcoin", "ethereum", "solana",
+        ]
         mock_universe.enrich_records.side_effect = lambda records: records
 
         mock_load_config.return_value = _make_mock_config()
