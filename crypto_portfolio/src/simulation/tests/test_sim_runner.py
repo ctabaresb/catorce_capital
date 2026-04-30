@@ -9,8 +9,11 @@
 # =============================================================================
 
 import io
-from unittest.mock import MagicMock
+import json
+import sys
+from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -19,7 +22,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 
 from simulation.sim_runner import (
-    _load_backtest_weights, _get_latest_backtest_key,
+    _load_backtest_weights, _get_latest_backtest_key, main,
     CANONICAL_SIM_FEE, CANONICAL_SIM_FREQUENCY,
 )
 
@@ -240,3 +243,188 @@ class TestGetLatestBacktestKey:
         }
         with pytest.raises(ValueError, match="No Gold backtest results found"):
             _get_latest_backtest_key(bucket="b", s3=s3)
+
+
+# ---------------------------------------------------------------------------
+# --smoke-test path
+#
+# The deploy.yml workflow runs `sim_runner.py --smoke-test` on Fargate after
+# pushing a new image. The test below is the critical regression gate the
+# user explicitly asked for: a future bug in the smoke branch that
+# accidentally writes Gold artifacts must fail this test.
+# ---------------------------------------------------------------------------
+
+def _make_silver_returns_parquet(coins=None, n_days=120):
+    """Build a Silver-shaped returns parquet bytes blob."""
+    if coins is None:
+        coins = ["bitcoin", "ethereum", "solana", "cardano"]
+    np.random.seed(42)
+    rows = []
+    for i in range(n_days):
+        dt = pd.Timestamp("2025-01-01") + pd.Timedelta(days=i)
+        for c in coins:
+            rows.append({
+                "coin_id":          c,
+                "date_day":         dt,
+                "log_return":       float(np.random.normal(0.001, 0.03)),
+                "return_after_fee": float(np.random.normal(0.001, 0.03)) - 0.0001,
+            })
+    df = pd.DataFrame(rows)
+    buf = io.BytesIO()
+    pq.write_table(pa.Table.from_pandas(df), buf, compression="snappy")
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _make_silver_prices_parquet(coins=None, n_days=120):
+    """Build a Silver-shaped prices parquet bytes blob with profile flags."""
+    if coins is None:
+        coins = ["bitcoin", "ethereum", "solana", "cardano"]
+    np.random.seed(42)
+    rows = []
+    base = {"bitcoin": 50000, "ethereum": 3000, "solana": 100, "cardano": 0.5}
+    for i in range(n_days):
+        dt = pd.Timestamp("2025-01-01") + pd.Timedelta(days=i)
+        for c in coins:
+            rows.append({
+                "coin_id":         c,
+                "date_day":        dt,
+                "close_price":     base.get(c, 100.0) * (1 + np.random.normal(0, 0.02)),
+                "in_conservative": c in ["bitcoin", "ethereum"],
+                "in_balanced":     True,
+                "in_aggressive":   True,
+            })
+    df = pd.DataFrame(rows)
+    buf = io.BytesIO()
+    pq.write_table(pa.Table.from_pandas(df), buf, compression="snappy")
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _make_results_parquet():
+    """Build a results.parquet bytes blob with the columns sim_runner reads."""
+    rows = []
+    for strategy in ["equal_weight", "momentum"]:
+        for winsorized in [False, True]:
+            rows.append({
+                "run_id":      f"{strategy}-balanced-monthly-0.001",
+                "strategy_id": strategy,
+                "profile":     "balanced",
+                "winsorized":  winsorized,
+            })
+    df = pd.DataFrame(rows)
+    buf = io.BytesIO()
+    pq.write_table(pa.Table.from_pandas(df), buf, compression="snappy")
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _build_smoke_test_s3_mock():
+    """
+    Mock boto3 s3 client that serves all reads sim_runner.main() does in
+    smoke mode. Captures all put_object calls so tests can assert on writes.
+    """
+    s3 = MagicMock()
+
+    class NoSuchKey(Exception):
+        pass
+    s3.exceptions = MagicMock()
+    s3.exceptions.NoSuchKey = NoSuchKey
+
+    returns_bytes = _make_silver_returns_parquet()
+    prices_bytes  = _make_silver_prices_parquet()
+    results_bytes = _make_results_parquet()
+    weights_df    = _make_weights_df()
+    weights_bytes = _df_to_parquet_bytes(weights_df)
+
+    # Paginator: returns silver objects depending on prefix
+    def _paginate(Bucket, Prefix):
+        if Prefix == "silver/returns/":
+            return [{"Contents": [{"Key": "silver/returns/date=2025-01-01/returns.parquet"}]}]
+        if Prefix == "silver/prices/":
+            return [{"Contents": [{"Key": "silver/prices/date=2025-01-01/prices.parquet"}]}]
+        return [{"Contents": []}]
+
+    paginator = MagicMock()
+    paginator.paginate.side_effect = lambda Bucket, Prefix: _paginate(Bucket, Prefix)
+    s3.get_paginator.return_value = paginator
+
+    # list_objects_v2: serves _get_latest_backtest_key
+    s3.list_objects_v2.return_value = {
+        "Contents": [
+            {"Key": "gold/backtest/grid_run_id=test-grid/results.parquet",
+             "LastModified": datetime.now(timezone.utc) - timedelta(seconds=10)},
+            {"Key": "gold/backtest/grid_run_id=test-grid/weights.parquet",
+             "LastModified": datetime.now(timezone.utc) - timedelta(seconds=5)},
+        ]
+    }
+
+    # get_object: dispatch by Key
+    def _get_object(Bucket, Key):
+        body = MagicMock()
+        if "silver/returns/" in Key:
+            body.read.return_value = returns_bytes
+        elif "silver/prices/" in Key:
+            body.read.return_value = prices_bytes
+        elif Key.endswith("/results.parquet"):
+            body.read.return_value = results_bytes
+        elif Key.endswith("/weights.parquet"):
+            body.read.return_value = weights_bytes
+        else:
+            raise NoSuchKey(f"NoSuchKey: {Key}")
+        return {"Body": body}
+    s3.get_object.side_effect = _get_object
+
+    return s3
+
+
+class TestSmokeTestPath:
+
+    def test_does_not_write_to_s3(self, capsys):
+        """CRITICAL regression gate: --smoke-test must NEVER call s3.put_object.
+        A future bug here would mean the deploy workflow's smoke step writes
+        Gold artifacts on every PR merge, polluting the data lake."""
+        s3 = _build_smoke_test_s3_mock()
+        with patch("simulation.sim_runner.boto3.client", return_value=s3), \
+             patch.object(sys, "argv",
+                          ["sim_runner.py", "--smoke-test", "--bucket", "test-bucket"]):
+            main()
+        assert not s3.put_object.called, (
+            f"put_object was called {s3.put_object.call_count} times in smoke mode — "
+            "the smoke test must not write any Gold artifacts."
+        )
+
+    def test_succeeds_with_valid_gold_data(self, capsys):
+        s3 = _build_smoke_test_s3_mock()
+        with patch("simulation.sim_runner.boto3.client", return_value=s3), \
+             patch.object(sys, "argv",
+                          ["sim_runner.py", "--smoke-test", "--bucket", "test-bucket"]):
+            main()
+        # logging.basicConfig defaults to stderr, so stdout contains only the
+        # json.dumps(summary) output that the deploy workflow surfaces.
+        out = capsys.readouterr().out.strip()
+        summary = json.loads(out)
+        assert summary["smoke_test"] == "passed"
+        assert summary["weights_combos_loaded"] > 0
+        assert len(summary["profiles_validated"]) > 0
+        for entry in summary["profiles_validated"]:
+            assert "profile" in entry
+            assert entry["eligible_coins"] >= 2
+            assert entry["engine_coin_ids"] >= 2
+
+    def test_fails_loudly_when_results_parquet_missing(self):
+        # Smoke must surface failure when a critical load can't complete —
+        # the whole point is to catch image-shipping regressions.
+        s3 = _build_smoke_test_s3_mock()
+        # Override list_objects_v2 to return ONLY weights.parquet (no results).
+        s3.list_objects_v2.return_value = {
+            "Contents": [
+                {"Key": "gold/backtest/grid_run_id=x/weights.parquet",
+                 "LastModified": datetime.now(timezone.utc)},
+            ]
+        }
+        with patch("simulation.sim_runner.boto3.client", return_value=s3), \
+             patch.object(sys, "argv",
+                          ["sim_runner.py", "--smoke-test", "--bucket", "test-bucket"]):
+            with pytest.raises(ValueError, match="No Gold backtest results found"):
+                main()

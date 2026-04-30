@@ -145,6 +145,13 @@ def main() -> None:
     parser.add_argument("--horizon-days",  type=int, default=365)
     parser.add_argument("--region",        default=os.environ.get("AWS_REGION", "us-east-1"))
     parser.add_argument("--profile-filter",default="")  # e.g. "conservative,balanced"
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Validate load paths against Gold without running simulations or "
+             "writing any output. Used by the deploy workflow to catch image-"
+             "shipping regressions in <60s. Exit 0 on success, non-zero on failure.",
+    )
     args = parser.parse_args()
 
     if not args.bucket:
@@ -185,6 +192,51 @@ def main() -> None:
     profiles = ["conservative", "balanced", "aggressive"]
     if args.profile_filter:
         profiles = [p for p in profiles if p in args.profile_filter.split(",")]
+
+    # ---- Smoke test short-circuit --------------------------------------------
+    # Validate the per-profile fit succeeds, then exit. Skips the GBM loop and
+    # all S3 writes. Used by .github/workflows/deploy.yml to catch image
+    # regressions before the next 00:30 UTC pipeline run.
+    if args.smoke_test:
+        smoke_start        = datetime.now(timezone.utc)
+        profiles_validated = []
+        for profile in profiles:
+            profile_col = f"in_{profile}"
+            if profile_col not in df_prices.columns:
+                logger.warning("[smoke] Profile column %s not in prices. Skipping.", profile_col)
+                continue
+            df_p = df_prices.copy()
+            df_p["date_day"] = pd.to_datetime(df_p["date_day"])
+            latest_prices = (
+                df_p.sort_values("date_day").groupby("coin_id").last().reset_index()
+            )
+            eligible = latest_prices[
+                latest_prices[profile_col].astype(str).str.lower() == "true"
+            ]["coin_id"].tolist()
+            if len(eligible) < 2:
+                logger.warning("[smoke] Profile %s has %d eligible coins (<2). Skipping.", profile, len(eligible))
+                continue
+            engine = CorrelationEngine(min_periods=30)
+            engine.fit(df_returns[df_returns["coin_id"].isin(eligible)], eligible)
+            profiles_validated.append({
+                "profile":         profile,
+                "eligible_coins":  len(eligible),
+                "engine_coin_ids": len(engine.coin_ids_),
+            })
+
+        elapsed = (datetime.now(timezone.utc) - smoke_start).total_seconds()
+        summary = {
+            "smoke_test":            "passed",
+            "backtest_key":          backtest_key,
+            "weights_combos_loaded": len(backtest_weights),
+            "profiles_validated":    profiles_validated,
+            "elapsed_seconds":       round(elapsed, 2),
+        }
+        logger.info("Smoke test PASSED: %d profiles, %d weights combos, %.2fs",
+                    len(profiles_validated), len(backtest_weights), elapsed)
+        # Print to stdout for the deploy workflow to surface on the run page.
+        print(json.dumps(summary, indent=2))
+        return
 
     all_stats      = []
     weights_audit  = {}  # (strategy_id, profile) -> "loaded_from_backtest" | "fallback_equal_weight"

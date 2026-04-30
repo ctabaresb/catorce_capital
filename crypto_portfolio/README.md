@@ -1104,6 +1104,16 @@ aws stepfunctions list-executions \
   --output table
 ```
 
+### Deploy the ECS image
+
+A push to `main` that touches `crypto_portfolio/src/`, `Dockerfile`, `requirements-ecs.txt`, `build_and_push.sh`, or `.github/workflows/deploy.yml` automatically triggers `.github/workflows/deploy.yml`. The workflow assumes the `crypto-platform-dev-github-actions-deploy` IAM role via OIDC, builds the image with GHA layer caching (~6 min cold, ~2 min cached), pushes both `:latest` and `:sha-<commit>` to ECR, then runs a Fargate smoke task that invokes `sim_runner.py --smoke-test`. The smoke task validates Silver loading, backtest-results lookup, weights-sidecar parsing, and `CorrelationEngine` fitting per profile — catching image-shipping regressions in ~30-60 s without running full simulations or writing any Gold artifacts.
+
+**Manual trigger** (force-rebuild, e.g., to refresh stale GHA cache or redeploy without a code change): in the GitHub Actions UI, select *Deploy ECS image* → *Run workflow* → branch `main`. The `workflow_dispatch` event runs the same job and is restricted by the OIDC trust policy to `main` only.
+
+**Reading the smoke result.** On success, the workflow run page prints the structured JSON summary (profiles validated, weights combos loaded, elapsed seconds) extracted from the smoke task's CloudWatch logs. On failure, the run fails red with the task ARN, stopped reason, and the same log block — start triage from CloudWatch group `/ecs/crypto-platform-dev-backtest`.
+
+**Recovery from a failed smoke.** ECR `:latest` was already updated before the smoke ran (Option 1: push-then-smoke), so the next 00:30 UTC pipeline will run against the broken image. Either revert the merge PR (`git revert <sha> && git push`, which re-fires `deploy.yml` with the previous good image) or merge a fix PR (which fires a fresh deploy). The `pipeline-step-functions-failed` alarm is the safety net if both paths are missed.
+
 ### Verify dashboard health via Cloudflare Worker
 The `/api/*` route is Access-gated, so a raw `curl` without an Access session cookie will be redirected to the login page. Two debug paths:
 
