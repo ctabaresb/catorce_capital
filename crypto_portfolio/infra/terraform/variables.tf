@@ -102,12 +102,6 @@ variable "coingecko_plan" {
 # ---------------------------------------------------------------------------
 # Lambda / Ingestion variables
 # ---------------------------------------------------------------------------
-variable "universe_size" {
-  description = "Number of top assets by market cap to ingest daily."
-  type        = number
-  default     = 100
-}
-
 variable "ingest_cron_schedule" {
   description = <<EOT
     EventBridge cron expression for daily ingestion.
