@@ -107,3 +107,60 @@ resource "aws_iam_role_policy" "github_actions_deploy_ecr" {
     ]
   })
 }
+
+# ---------------------------------------------------------------------------
+# 4. ECS run-task permissions for the deploy.yml smoke-test step
+#    Narrow scoping:
+#      - RunTask: only the crypto-platform-dev-backtest task family, only
+#        in the crypto-platform-dev cluster
+#      - DescribeTasks: only tasks within the crypto-platform-dev cluster
+#      - PassRole: only the two ECS roles, only when handed to ECS
+#        (iam:PassedToService condition is the standard mitigation against
+#        role exfiltration via PassRole)
+# ---------------------------------------------------------------------------
+resource "aws_iam_role_policy" "github_actions_deploy_smoke" {
+  name = "ecs-run-smoke-test"
+  role = aws_iam_role.github_actions_deploy.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "RunSmokeTestTask"
+        Effect = "Allow"
+        Action = "ecs:RunTask"
+        Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${aws_ecs_task_definition.backtest.family}:*"
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = aws_ecs_cluster.main.arn
+          }
+        }
+      },
+      {
+        Sid    = "DescribeSmokeTestTask"
+        Effect = "Allow"
+        Action = "ecs:DescribeTasks"
+        Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*"
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = aws_ecs_cluster.main.arn
+          }
+        }
+      },
+      {
+        Sid    = "PassEcsRolesForSmoke"
+        Effect = "Allow"
+        Action = "iam:PassRole"
+        Resource = [
+          aws_iam_role.ecs_task.arn,
+          aws_iam_role.ecs_execution.arn,
+        ]
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "ecs-tasks.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+}
