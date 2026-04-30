@@ -76,9 +76,6 @@ resource "aws_lambda_function" "ingest_eod" {
       # S3 target
       DATA_LAKE_BUCKET = var.data_lake_bucket_name
 
-      # Pipeline config
-      UNIVERSE_SIZE = tostring(var.universe_size)
-
       # Alerting
       SNS_TOPIC_ARN = aws_sns_topic.pipeline_alerts.arn
 

@@ -137,12 +137,6 @@ resource "aws_ssm_parameter" "data_lake_bucket" {
   value = var.data_lake_bucket_name
 }
 
-resource "aws_ssm_parameter" "universe_size" {
-  name  = "/${var.project_name}/${var.environment}/universe-size"
-  type  = "String"
-  value = tostring(var.universe_size)
-}
-
 resource "aws_ssm_parameter" "coingecko_secret_arn" {
   name  = "/${var.project_name}/${var.environment}/coingecko-secret-arn"
   type  = "String"
