@@ -141,7 +141,7 @@ footer{text-align:center;font-size:11px;color:var(--text-muted);margin-top:2rem}
     <div class="metric-sub">1,000 GBM simulations</div>
   </div>
   <div class="metric">
-    <div class="metric-label">Assets in universe</div>
+    <div class="metric-label">Eligible assets</div>
     <div class="metric-val" id="m-assets">—</div>
     <div class="metric-sub" id="m-assets-sub">3 risk tiers</div>
   </div>
@@ -229,10 +229,13 @@ async function loadAll(){
       health.data_layers.silver_prices_date
         ?'Data through '+health.data_layers.silver_prices_date
         :'Crypto portfolio optimization platform';
-    document.getElementById('m-assets').textContent=universe.count||'—';
-    const cons=(universe.assets||[]).filter(a=>a.in_conservative).length;
+    const assets=universe.assets||[];
+    const cons=assets.filter(a=>a.in_conservative).length;
+    const bal =assets.filter(a=>a.in_balanced).length;
+    const agg =assets.filter(a=>a.in_aggressive).length;
+    document.getElementById('m-assets').textContent=agg||'—';
     document.getElementById('m-assets-sub').textContent=
-      cons+' conservative · '+(universe.count-cons)+' other';
+      cons+' conservative · '+bal+' balanced · '+agg+' aggressive';
     allStrategies=strats.strategies||[];
     allSims=sims.results||[];
     renderAll();
