@@ -241,6 +241,24 @@ class TestUniverseManager:
         for s in stablecoins:
             assert s not in validation_set
 
+    def test_sky_replaces_maker(self):
+        # MakerDAO rebranded to Sky in late 2024 / early 2025; CoinGecko's
+        # `maker` ID was deprecated. PR-A swaps the entry. The investment
+        # thesis (DeFi blue chip) is unchanged, so risk_tier and category
+        # are retained; max_mcap_rank is bumped from 40 to 50 because Sky
+        # currently sits at rank ~45.
+        all_ids = set(UNIVERSE.get_all_coin_ids(include_excluded=True))
+        assert "sky" in all_ids
+        assert "maker" not in all_ids
+
+        sky = UNIVERSE.get_asset("sky")
+        assert sky is not None
+        assert sky.symbol == "sky"
+        assert sky.name == "Sky"
+        assert sky.category == AssetCategory.DEFI
+        assert sky.risk_tier == RiskTier.HIGH
+        assert sky.max_mcap_rank == 50
+
 
 # ---------------------------------------------------------------------------
 # coingecko_client.py tests (mocked HTTP - no real API calls)

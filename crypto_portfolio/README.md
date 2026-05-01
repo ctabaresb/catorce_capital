@@ -904,7 +904,10 @@ The GBM simulation runs each strategy/profile combination with equal weights as 
 Both profiles have 19 eligible assets after the 50% coverage filter because the aggressive-tier coins (TAO, FET, AGIX etc.) all have exactly 365 days of history from the backfill, same as the balanced-tier coins. They naturally differentiate over time as daily data accumulates.
 
 **Simulation coverage lag for newly-added universe coins**  
-When a new coin is added to `universe.py`, it appears in daily Silver immediately but won't participate in GBM simulation until it accumulates ~196 days of returns (50% of the Silver coverage window). For the current universe, all 27 coins will be eligible after ~6 months. The simulation already discloses this via `weights_audit.json` showing `loaded_count` per profile.
+When a new coin is added to `universe.py`, it appears in daily Silver immediately but won't participate in GBM simulation until it accumulates ~196 days of returns (50% of the Silver coverage window). PR-A backfills bittensor / sui / celestia / pendle / sky covering 2025-04-09 through today, closing the lag for those five additions. Future universe additions still face the ~6-month accumulation window unless backfilled in the same way. The simulation discloses current coverage via `weights_audit.json` showing `loaded_count` per profile.
+
+**MakerDAO → Sky migration**  
+MakerDAO rebranded to Sky in late 2024 / early 2025. CoinGecko deprecated the `maker` coin ID. PR-A swaps the universe entry from `maker` (mkr, max_mcap_rank=40) to `sky` (sky, max_mcap_rank=50). Historical Silver retains the `maker` rows it received before the swap; new Silver from PR-A onwards records `sky`. The DeFi-blue-chip thesis is unchanged.
 
 ---
 
