@@ -174,7 +174,7 @@ UNIVERSE_SEED: list[AssetDefinition] = [
 
     # DeFi disruption
     AssetDefinition("injective-protocol","inj","Injective",      AssetCategory.DEFI,           RiskTier.HIGH,      50),
-    AssetDefinition("maker",         "mkr",   "MakerDAO",        AssetCategory.DEFI,           RiskTier.HIGH,      40),
+    AssetDefinition("sky",           "sky",   "Sky",             AssetCategory.DEFI,           RiskTier.HIGH,      50),
 
     # -------------------------------------------------------------------------
     # MEME TIER (Very high risk, Aggressive only)
