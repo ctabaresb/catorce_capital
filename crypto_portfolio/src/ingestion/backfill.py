@@ -52,7 +52,13 @@ from botocore.exceptions import ClientError
 
 from ingestion.coingecko_client import CoinGeckoClient, CoinGeckoConfig
 from ingestion.s3_writer import S3Writer
-from ingestion.universe import UNIVERSE, PortfolioProfile
+from ingestion.universe import (
+    UNIVERSE,
+    PortfolioProfile,
+    AssetCategory,
+    RiskTier,
+    PROFILE_ELIGIBLE_TIERS,
+)
 from transform.prices_transform import PricesTransformer
 from transform.returns_compute import ReturnsComputer
 
@@ -135,6 +141,7 @@ class HistoricalBackfill:
         start_date: str,
         end_date: str,
         max_assets: int | None = None,
+        coin_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Run the full backfill pipeline.
@@ -143,6 +150,12 @@ class HistoricalBackfill:
             start_date:  YYYY-MM-DD inclusive
             end_date:    YYYY-MM-DD inclusive
             max_assets:  limit number of assets (useful for testing)
+            coin_ids:    targeted backfill — fetch only these CoinGecko IDs
+                         and MERGE rows into existing Silver partitions
+                         instead of overwriting. Unknown IDs (not in
+                         UNIVERSE_SEED) are still fetched, but their
+                         universe flags will be False (treated as
+                         unknowns by enrich_records).
 
         Returns:
             Summary dict with counts and any errors
@@ -152,11 +165,25 @@ class HistoricalBackfill:
             "Starting backfill: %s to %s", start_date, end_date
         )
 
-        # Get all investable assets (excludes stablecoins)
-        coin_ids = UNIVERSE.get_investable_ids()
-        if max_assets:
-            coin_ids = coin_ids[:max_assets]
-            logger.info("Limited to %d assets for testing", max_assets)
+        # Targeted mode: a specific list of coins. The Silver write path
+        # MERGES rather than overwrites, preserving rows for other coins
+        # in each date partition. See _merge_silver_prices_partition.
+        targeted_mode = bool(coin_ids)
+
+        if targeted_mode:
+            # Filter to the requested IDs. Preserve order from the caller
+            # for deterministic logging.
+            coin_ids = list(coin_ids)
+            logger.info(
+                "Targeted backfill mode: coins=%s (Silver writes will MERGE)",
+                coin_ids,
+            )
+        else:
+            # Full backfill: all investable assets (excludes stablecoins).
+            coin_ids = UNIVERSE.get_investable_ids()
+            if max_assets:
+                coin_ids = coin_ids[:max_assets]
+                logger.info("Limited to %d assets for testing", max_assets)
 
         logger.info("Assets to backfill: %d", len(coin_ids))
 
@@ -223,7 +250,23 @@ class HistoricalBackfill:
         for date_val, group in df_prices.groupby("date_day"):
             date_str = pd.Timestamp(date_val).strftime("%Y-%m-%d")
 
-            # Skip if already written and resume mode is on
+            # In targeted mode we always MERGE — skipping based on
+            # existence would silently drop the targeted coin's rows
+            # whenever the partition already contains other coins.
+            if targeted_mode:
+                try:
+                    self._merge_silver_prices_partition(group.copy(), date_str)
+                    dates_written += 1
+                except Exception as exc:
+                    logger.error(
+                        "Failed to merge silver prices for %s: %s", date_str, str(exc)
+                    )
+                    errors.append({
+                        "date": date_str, "error": str(exc), "phase": "silver_prices_merge"
+                    })
+                continue
+
+            # Full-backfill mode: original semantics (resume-skip + overwrite).
             if self.resume and self._silver_prices_exists(date_str):
                 logger.debug("Skipping existing silver prices: %s", date_str)
                 dates_skipped += 1
@@ -265,7 +308,10 @@ class HistoricalBackfill:
             for date_val, group in df_returns.groupby("date_day"):
                 date_str = pd.Timestamp(date_val).strftime("%Y-%m-%d")
                 try:
-                    self.returns._write_returns(group.copy(), date=date_str)
+                    if targeted_mode:
+                        self._merge_silver_returns_partition(group.copy(), date_str)
+                    else:
+                        self.returns._write_returns(group.copy(), date=date_str)
                     dates_returns += 1
                 except Exception as exc:
                     logger.warning("Failed to write returns for %s: %s", date_str, exc)
@@ -434,6 +480,14 @@ class HistoricalBackfill:
         Build daily prices panel directly from in-memory fetch_results.
         Avoids S3 re-read path mismatch entirely.
         fetch_results[coin_id] = {prices: [[ts_ms, val],...], market_caps: [...], volumes: [...]}
+
+        Each per-coin frame is enriched with universe metadata
+        (`category`, `risk_tier`, `in_conservative`, `in_balanced`,
+        `in_aggressive`) using the same logic as
+        `UNIVERSE.enrich_records()`. Without enrichment, downstream
+        Silver writes leave these schema columns as NULL and the
+        backtest/simulation eligibility filters (which compare against
+        the string `"true"`) silently exclude every backfilled coin.
         """
         frames = []
         for coin_id, result in fetch_results.items():
@@ -455,6 +509,26 @@ class HistoricalBackfill:
             df["coin_id"] = coin_id
             df = df.drop(columns=["ts_ms"])
             df = df.drop_duplicates(subset=["coin_id", "date_day"], keep="last")
+
+            # Universe enrichment — mirrors UNIVERSE.enrich_records()
+            # exactly so the in_* flags are bit-identical to what the
+            # daily transform writes for a Bronze-derived row.
+            asset = UNIVERSE.get_asset(coin_id)
+            df["category"]  = asset.category.value  if asset else AssetCategory.OTHER.value
+            df["risk_tier"] = asset.risk_tier.value if asset else RiskTier.HIGH.value
+            df["in_conservative"] = bool(
+                asset is not None
+                and asset.risk_tier in PROFILE_ELIGIBLE_TIERS[PortfolioProfile.CONSERVATIVE]
+            )
+            df["in_balanced"] = bool(
+                asset is not None
+                and asset.risk_tier in PROFILE_ELIGIBLE_TIERS[PortfolioProfile.BALANCED]
+            )
+            df["in_aggressive"] = bool(
+                asset is not None
+                and asset.risk_tier != RiskTier.EXCLUDED
+            )
+
             frames.append(df)
         if not frames:
             return pd.DataFrame()
@@ -569,28 +643,29 @@ class HistoricalBackfill:
     # Phase 3: Write Silver prices directly from panel
     # -------------------------------------------------------------------------
 
-    def _write_silver_prices_direct(
+    def _prepare_silver_prices_df(
         self,
         df: pd.DataFrame,
         date: str,
-    ) -> None:
+    ) -> pd.DataFrame:
         """
-        Write a single date partition to Silver prices Parquet.
-        Called per date in Phase 3 of the backfill.
+        Project an in-memory price panel slice onto SILVER_PRICES_SCHEMA.
+        Adds missing columns with defaults; reorders for the writer.
+        Does NOT write to S3.
         """
-        import io
-        import pyarrow as pa
-        import pyarrow.parquet as pq
         from transform.prices_transform import SILVER_PRICES_SCHEMA
 
-        # Add required columns with defaults if missing
+        df = df.copy()
         df["date_day"]      = date
         df["symbol"]        = df.get("symbol", df["coin_id"])
         df["name"]          = df.get("name",   df["coin_id"])
         df["ingestion_ts"]  = datetime.now(timezone.utc).isoformat()
-        df["data_flags"]    = None
-        df["price_change_24h"] = None
-        df["market_cap_rank"]  = None
+        if "data_flags" not in df.columns:
+            df["data_flags"] = None
+        if "price_change_24h" not in df.columns:
+            df["price_change_24h"] = None
+        if "market_cap_rank" not in df.columns:
+            df["market_cap_rank"] = None
 
         schema_cols = [f.name for f in SILVER_PRICES_SCHEMA]
         for col in schema_cols:
@@ -599,6 +674,23 @@ class HistoricalBackfill:
 
         df = df[schema_cols]
         df["date_day"] = pd.to_datetime(df["date_day"]).dt.date
+        return df
+
+    def _write_silver_prices_direct(
+        self,
+        df: pd.DataFrame,
+        date: str,
+    ) -> None:
+        """
+        Write a single date partition to Silver prices Parquet, OVERWRITING
+        any existing partition. Used by full-backfill mode.
+        """
+        import io
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from transform.prices_transform import SILVER_PRICES_SCHEMA
+
+        df = self._prepare_silver_prices_df(df, date)
 
         table  = pa.Table.from_pandas(df, schema=SILVER_PRICES_SCHEMA, safe=False)
         buffer = io.BytesIO()
@@ -614,6 +706,160 @@ class HistoricalBackfill:
         )
 
         logger.debug("Wrote silver prices: date=%s records=%d", date, len(df))
+
+    def _merge_silver_prices_partition(
+        self,
+        new_df: pd.DataFrame,
+        date: str,
+    ) -> None:
+        """
+        Merge `new_df` rows into the existing Silver prices partition for
+        `date`, preserving rows for any coins NOT in `new_df`.
+
+        **Dedup rule (documented contract):** when an incoming coin_id
+        already has a row in the existing partition for this date, the
+        INCOMING row wins. Each collision is logged at WARNING level
+        with the colliding coin_ids. This is the documented behavior
+        for `--coin-ids` targeted backfills, where the operator's
+        intent is "replace whatever is there for these coins, leave
+        everything else alone."
+
+        If the existing partition is missing entirely, this method
+        creates it from `new_df` alone (equivalent to a fresh write).
+        """
+        import io
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from transform.prices_transform import SILVER_PRICES_SCHEMA
+
+        new_df = self._prepare_silver_prices_df(new_df, date)
+
+        key = f"silver/prices/date={date}/prices.parquet"
+        existing_df = self._read_silver_partition_safely(key)
+
+        if existing_df is None or existing_df.empty:
+            merged = new_df
+            logger.info(
+                "Silver prices partition created (no prior): date=%s records=%d",
+                date, len(merged),
+            )
+        else:
+            new_coins      = set(new_df["coin_id"])
+            existing_coins = set(existing_df["coin_id"])
+            collisions     = sorted(new_coins & existing_coins)
+            if collisions:
+                logger.warning(
+                    "Silver prices merge collision on date=%s: incoming wins for coins=%s",
+                    date, collisions,
+                )
+            kept   = existing_df[~existing_df["coin_id"].isin(new_coins)]
+            merged = pd.concat([kept, new_df], ignore_index=True, sort=False)
+            logger.info(
+                "Silver prices merged: date=%s kept=%d new=%d total=%d",
+                date, len(kept), len(new_df), len(merged),
+            )
+
+        # Project merged onto schema column order — concat may have
+        # reordered. Existing rows already conform to schema; new rows
+        # were prepared. Ensure final ordering matches SILVER_PRICES_SCHEMA.
+        schema_cols = [f.name for f in SILVER_PRICES_SCHEMA]
+        merged = merged[schema_cols]
+
+        table  = pa.Table.from_pandas(merged, schema=SILVER_PRICES_SCHEMA, safe=False)
+        buffer = io.BytesIO()
+        pq.write_table(table, buffer, compression="snappy", write_statistics=True)
+        buffer.seek(0)
+
+        self._s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=buffer.getvalue(),
+            ContentType="application/octet-stream",
+        )
+
+    def _merge_silver_returns_partition(
+        self,
+        new_df: pd.DataFrame,
+        date: str,
+    ) -> None:
+        """
+        Merge new returns rows into the existing Silver returns
+        partition for `date`. Same dedup rule as
+        `_merge_silver_prices_partition`: incoming coin_id wins on
+        collision, warning logged.
+        """
+        import io
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from transform.returns_compute import SILVER_RETURNS_SCHEMA
+
+        new_df = new_df.copy()
+        if "market_cap_rank" in new_df.columns:
+            new_df["market_cap_rank"] = pd.to_numeric(
+                new_df["market_cap_rank"], errors="coerce"
+            ).astype("Int32")
+
+        key = f"silver/returns/date={date}/returns.parquet"
+        existing_df = self._read_silver_partition_safely(key)
+
+        if existing_df is None or existing_df.empty:
+            merged = new_df
+            logger.info(
+                "Silver returns partition created (no prior): date=%s records=%d",
+                date, len(merged),
+            )
+        else:
+            new_coins      = set(new_df["coin_id"])
+            existing_coins = set(existing_df["coin_id"])
+            collisions     = sorted(new_coins & existing_coins)
+            if collisions:
+                logger.warning(
+                    "Silver returns merge collision on date=%s: incoming wins for coins=%s",
+                    date, collisions,
+                )
+            kept   = existing_df[~existing_df["coin_id"].isin(new_coins)]
+            merged = pd.concat([kept, new_df], ignore_index=True, sort=False)
+            logger.info(
+                "Silver returns merged: date=%s kept=%d new=%d total=%d",
+                date, len(kept), len(new_df), len(merged),
+            )
+
+        schema_cols = [f.name for f in SILVER_RETURNS_SCHEMA]
+        # Ensure all schema columns exist (some merged rows may lack
+        # newer optional columns).
+        for col in schema_cols:
+            if col not in merged.columns:
+                merged[col] = None
+        merged = merged[schema_cols]
+
+        table  = pa.Table.from_pandas(merged, schema=SILVER_RETURNS_SCHEMA, safe=False)
+        buffer = io.BytesIO()
+        pq.write_table(table, buffer, compression="snappy", write_statistics=True)
+        buffer.seek(0)
+
+        self._s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=buffer.getvalue(),
+            ContentType="application/octet-stream",
+        )
+
+    def _read_silver_partition_safely(self, key: str) -> pd.DataFrame | None:
+        """
+        Read an existing Silver partition into a DataFrame.
+        Returns None if the partition does not exist.
+        Raises any other ClientError unmodified.
+        """
+        import io
+        import pyarrow.parquet as pq
+
+        try:
+            obj = self._s3.get_object(Bucket=self.bucket, Key=key)
+            return pq.read_table(io.BytesIO(obj["Body"].read())).to_pandas()
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                return None
+            raise
 
     # -------------------------------------------------------------------------
     # Utilities
@@ -721,6 +967,17 @@ def main():
         help="Limit assets for testing (default: all)",
     )
     parser.add_argument(
+        "--coin-ids",
+        default=None,
+        help=(
+            "Comma-separated CoinGecko IDs for a TARGETED backfill "
+            "(e.g. bittensor,sui,celestia). When set, Silver writes "
+            "MERGE into existing partitions instead of overwriting — "
+            "preserving rows for other coins. The incoming row wins on "
+            "any (coin_id, date) collision; warnings are logged."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         default=True,
@@ -769,10 +1026,15 @@ def main():
         resume          = args.resume,
     )
 
+    coin_ids_arg = None
+    if args.coin_ids:
+        coin_ids_arg = [c.strip() for c in args.coin_ids.split(",") if c.strip()]
+
     summary = backfill.run(
         start_date = args.start_date,
         end_date   = args.end_date,
         max_assets = args.max_assets,
+        coin_ids   = coin_ids_arg,
     )
 
     print(json.dumps(summary, indent=2))
