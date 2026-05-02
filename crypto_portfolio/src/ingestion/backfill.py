@@ -914,25 +914,68 @@ class HistoricalBackfill:
 # ---------------------------------------------------------------------------
 
 def _load_aws_config(args) -> dict:
-    """Load API key from Secrets Manager or CLI arg."""
-    api_key = args.api_key
+    """
+    Resolve `api_key` and `plan` from CLI args, Secrets Manager, or
+    sensible defaults — in that priority order.
 
-    if not api_key:
-        # Try Secrets Manager (production path)
-        secret_arn = os.environ.get("COINGECKO_SECRET_ARN")
-        if secret_arn:
-            sm = boto3.client("secretsmanager",
-                              region_name=args.region)
+    Priority for both fields:
+      1. CLI flag (or matching env var resolved at argparse time)
+      2. Secrets Manager (if `COINGECKO_SECRET_ARN` env var is set)
+      3. Default fallback (`free-tier` / `demo`)
+
+    The Lambda's `_load_config` reads the same secret. Mirroring that
+    here keeps the local CLI consistent with production and removes
+    the silent-default mismatch that produced PR-A.2 (CLI defaulting
+    to plan=demo while the project is on plan=pro, leading to
+    CoinGecko HTTP 400 with "use pro-api.coingecko.com" message).
+
+    The resolved source of each value is logged so any future
+    mismatch surfaces in the operational log immediately.
+    """
+    cli_api_key = args.api_key or None
+    cli_plan    = args.plan         # may be None if not supplied
+
+    secret_api_key = None
+    secret_plan    = None
+
+    secret_arn = os.environ.get("COINGECKO_SECRET_ARN")
+    if secret_arn:
+        try:
+            sm = boto3.client("secretsmanager", region_name=args.region)
             secret = json.loads(
                 sm.get_secret_value(SecretId=secret_arn)["SecretString"]
             )
-            api_key = secret.get("api_key", "free-tier")
-            logger.info("Loaded API key from Secrets Manager")
-        else:
-            api_key = "free-tier"
-            logger.warning("No API key found. Using free tier without key.")
+            secret_api_key = secret.get("api_key")
+            secret_plan    = secret.get("plan")
+        except Exception as exc:
+            logger.warning(
+                "Could not read CoinGecko secret from Secrets Manager: %s", exc
+            )
 
-    return {"api_key": api_key}
+    # Resolve api_key
+    if cli_api_key:
+        api_key, api_key_source = cli_api_key, "CLI/env override"
+    elif secret_api_key:
+        api_key, api_key_source = secret_api_key, "Secrets Manager"
+    else:
+        api_key, api_key_source = "free-tier", "default fallback (no key)"
+
+    # Resolve plan
+    if cli_plan:
+        plan, plan_source = cli_plan, "CLI/env override"
+    elif secret_plan:
+        plan, plan_source = secret_plan, "Secrets Manager"
+    else:
+        plan, plan_source = "demo", "default fallback"
+
+    # Mask the api_key in logs.
+    masked = "free-tier" if api_key == "free-tier" else f"{api_key[:3]}***"
+    logger.info(
+        "CoinGecko config resolved: plan=%s (from %s); api_key=%s (from %s)",
+        plan, plan_source, masked, api_key_source,
+    )
+
+    return {"api_key": api_key, "plan": plan}
 
 
 def main():
@@ -992,8 +1035,13 @@ def main():
     parser.add_argument(
         "--plan",
         choices=["free", "demo", "pro"],
-        default=os.environ.get("COINGECKO_PLAN", "demo"),
-        help="CoinGecko plan tier: free, demo (Basic paid CG- keys), pro (default: demo)",
+        default=os.environ.get("COINGECKO_PLAN"),
+        help=(
+            "CoinGecko plan tier: free, demo (Basic paid CG- keys), pro. "
+            "When omitted, resolves from the Secrets Manager secret named "
+            "by COINGECKO_SECRET_ARN. Falls back to 'demo' only if neither "
+            "is available."
+        ),
     )
     parser.add_argument(
         "--api-key",
@@ -1008,19 +1056,20 @@ def main():
 
     args = parser.parse_args()
 
-    # Load AWS config
+    # Load AWS config — resolves api_key AND plan with consistent priority
+    # (CLI/env override > Secrets Manager > default). See _load_aws_config.
     aws_config = _load_aws_config(args)
 
     logger.info(
         "Starting backfill: bucket=%s start=%s end=%s plan=%s max_assets=%s",
         args.bucket, args.start_date, args.end_date,
-        args.plan, args.max_assets,
+        aws_config["plan"], args.max_assets,
     )
 
     backfill = HistoricalBackfill(
         bucket          = args.bucket,
         api_key         = aws_config["api_key"],
-        plan            = args.plan,
+        plan            = aws_config["plan"],
         region          = args.region,
         rebalancing_fee = args.fee,
         resume          = args.resume,

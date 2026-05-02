@@ -8,15 +8,17 @@
 #   pytest src/ingestion/tests/test_backfill.py -v
 # =============================================================================
 
+import argparse
 import json
 import gzip
+import os
 from datetime import date
 from unittest.mock import MagicMock, patch, call
 
 import pandas as pd
 import pytest
 
-from ingestion.backfill import HistoricalBackfill
+from ingestion.backfill import HistoricalBackfill, _load_aws_config
 
 
 # ---------------------------------------------------------------------------
@@ -501,3 +503,108 @@ class TestSilverPartitionMerge:
         merged = self._captured_merged_df(bf)
         assert len(merged) == 1
         assert merged.iloc[0]["coin_id"] == "celestia"
+
+
+# ---------------------------------------------------------------------------
+# PR-A.2: plan resolution priority — CLI/env override > Secrets Manager > default
+# ---------------------------------------------------------------------------
+
+class TestLoadAwsConfig:
+    """The Lambda reads `plan` from the same Secrets Manager secret as
+    `api_key`. The CLI now does the same, removing the silent-default
+    mismatch that caused the sky backfill to default to plan=demo while
+    the project's actual plan is pro (PR-A.2 lesson)."""
+
+    def _make_args(self, *, api_key="", plan=None, region="us-east-1"):
+        return argparse.Namespace(
+            api_key=api_key, plan=plan, region=region,
+        )
+
+    def _patch_secrets_manager(self, *, api_key="CG-secret-xxx", plan="pro"):
+        """Returns a mock secretsmanager client that returns the given
+        secret payload."""
+        mock_sm = MagicMock()
+        mock_sm.get_secret_value.return_value = {
+            "SecretString": json.dumps({"api_key": api_key, "plan": plan})
+        }
+        return mock_sm
+
+    def test_plan_from_secret_when_no_cli_or_env_override(self):
+        """The most important regression guard: when the user runs the
+        CLI without --plan and without COINGECKO_PLAN env, plan should
+        come from the Secrets Manager secret. Previously it would have
+        defaulted to 'demo' regardless of the secret's contents."""
+        args = self._make_args()  # plan=None, no api_key
+
+        mock_sm = self._patch_secrets_manager(api_key="CG-secret-xxx", plan="pro")
+        with patch.dict(os.environ, {"COINGECKO_SECRET_ARN": "arn:fake"}, clear=False):
+            with patch("ingestion.backfill.boto3.client", return_value=mock_sm):
+                result = _load_aws_config(args)
+
+        assert result["plan"] == "pro"
+        assert result["api_key"] == "CG-secret-xxx"
+
+    def test_cli_plan_overrides_secret(self):
+        """User must be able to test other tiers without modifying the
+        secret. CLI --plan flag wins over Secrets Manager value."""
+        args = self._make_args(plan="demo")  # explicit override
+
+        mock_sm = self._patch_secrets_manager(api_key="CG-secret-xxx", plan="pro")
+        with patch.dict(os.environ, {"COINGECKO_SECRET_ARN": "arn:fake"}, clear=False):
+            with patch("ingestion.backfill.boto3.client", return_value=mock_sm):
+                result = _load_aws_config(args)
+
+        assert result["plan"] == "demo"   # CLI override wins
+        assert result["api_key"] == "CG-secret-xxx"  # secret still used for key
+
+    def test_cli_api_key_overrides_secret(self):
+        """Symmetry: CLI --api-key flag wins over Secrets Manager value."""
+        args = self._make_args(api_key="CG-cli-override")
+
+        mock_sm = self._patch_secrets_manager(api_key="CG-secret-xxx", plan="pro")
+        with patch.dict(os.environ, {"COINGECKO_SECRET_ARN": "arn:fake"}, clear=False):
+            with patch("ingestion.backfill.boto3.client", return_value=mock_sm):
+                result = _load_aws_config(args)
+
+        assert result["api_key"] == "CG-cli-override"
+        # Plan still resolves from the secret because no CLI override on plan.
+        assert result["plan"] == "pro"
+
+    def test_default_fallback_when_no_secret_no_cli(self):
+        """Strictly local invocation with no secret access and no CLI
+        flags falls back to free-tier / demo. Loud log expected."""
+        args = self._make_args()
+        with patch.dict(os.environ, {}, clear=True):  # no COINGECKO_SECRET_ARN
+            result = _load_aws_config(args)
+
+        assert result["plan"] == "demo"
+        assert result["api_key"] == "free-tier"
+
+    def test_secret_read_failure_falls_back_gracefully(self):
+        """If the secret ARN is set but the read fails (IAM, network),
+        we warn-log and fall back to defaults instead of crashing."""
+        args = self._make_args()
+        mock_sm = MagicMock()
+        mock_sm.get_secret_value.side_effect = Exception("AccessDenied")
+
+        with patch.dict(os.environ, {"COINGECKO_SECRET_ARN": "arn:fake"}, clear=False):
+            with patch("ingestion.backfill.boto3.client", return_value=mock_sm):
+                result = _load_aws_config(args)
+
+        assert result["plan"] == "demo"
+        assert result["api_key"] == "free-tier"
+
+    def test_secret_with_missing_plan_field_falls_back(self):
+        """If the secret has api_key but no plan field, plan falls back
+        to default; api_key is still read."""
+        args = self._make_args()
+        mock_sm = MagicMock()
+        mock_sm.get_secret_value.return_value = {
+            "SecretString": json.dumps({"api_key": "CG-only"})  # no plan
+        }
+        with patch.dict(os.environ, {"COINGECKO_SECRET_ARN": "arn:fake"}, clear=False):
+            with patch("ingestion.backfill.boto3.client", return_value=mock_sm):
+                result = _load_aws_config(args)
+
+        assert result["api_key"] == "CG-only"
+        assert result["plan"] == "demo"
