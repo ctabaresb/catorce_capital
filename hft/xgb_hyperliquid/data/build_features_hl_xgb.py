@@ -535,13 +535,20 @@ def add_time_features(df):
 def build_hl_features(minute_path, output_path, config_path=None,
                       horizons_m=None,
                       indicator_path=None, bn_path=None, cb_path=None,
-                      asset="btc_usd"):
+                      asset="btc_usd",
+                      max_indicator_age_days=7):
     """
     v5: Pure feature builder. No targets — those are computed lazily at
     train/sweep time via data/targets.py (bid/ask-aware, parameterized cost).
 
     horizons_m is accepted for back-compat but unused (it belonged to target
     construction, which no longer happens here).
+
+    max_indicator_age_days: drop the entire hl_* feature group if the
+    indicator parquet's latest timestamp is older than this threshold
+    relative to the feature data. Prevents the model from learning split
+    thresholds on a small unrepresentative sample (e.g., when the metrics
+    recorder has stopped and most rows have NaN). Default 7 days.
     """
     if horizons_m is None:
         horizons_m = [1, 2, 5, 10]
@@ -573,11 +580,30 @@ def build_hl_features(minute_path, output_path, config_path=None,
 
     df = df.sort_values("ts_min").reset_index(drop=True)
 
-    # Load indicator data
+    # Load indicator data — gated by freshness so we don't merge mostly-NaN
+    # features and teach the model brittle splits on a small unrepresentative
+    # sample of valid hl_* values.
     ind_df = None
     if indicator_path and os.path.exists(indicator_path):
-        ind_df = pd.read_parquet(indicator_path)
-        print(f"  Indicators: {len(ind_df):,} rows x {ind_df.shape[1]} cols")
+        _raw_ind = pd.read_parquet(indicator_path)
+        _ts_col = next((c for c in ["timestamp_utc", "ts", "timestamp", "time", "dt"]
+                        if c in _raw_ind.columns), None)
+        if _ts_col is None:
+            print(f"  Indicators: no timestamp column found, SKIPPING hl_* features")
+        else:
+            ind_max = pd.to_datetime(_raw_ind[_ts_col], utc=True, errors="coerce").max()
+            feat_max = pd.to_datetime(df["ts_min"], utc=True, errors="coerce").max()
+            age_days = (feat_max - ind_max).total_seconds() / 86400.0
+            if age_days > max_indicator_age_days:
+                print(f"  Indicators stale by {age_days:.1f}d "
+                      f"(threshold: {max_indicator_age_days}d) — "
+                      f"SKIPPING hl_* features entirely")
+                print(f"    latest indicator ts: {ind_max}")
+                print(f"    latest feature ts:   {feat_max}")
+            else:
+                ind_df = _raw_ind
+                print(f"  Indicators: {len(ind_df):,} rows x {ind_df.shape[1]} cols "
+                      f"(latest {age_days:.1f}d old)")
 
     # ── Step 1: DOM velocity ──────────────────────────────────────────────
     print(f"\n  [1/6] DOM velocity...")
@@ -654,6 +680,11 @@ def main():
     ap.add_argument("--leadlag_v4_dir", default="data/lead_lag_1m",
                     help="Directory of v4 tick-aggregated leader parquets "
                          "(used when --leadlag_source=v4_ticks)")
+    ap.add_argument("--max_indicator_age_days", type=int, default=7,
+                    help="Skip hl_* features entirely if indicator parquet's "
+                         "latest timestamp is older than this (days) vs the "
+                         "feature data. Prevents regime-overfit splits on a "
+                         "small valid sample. Default 7.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -705,7 +736,8 @@ def main():
             ind_path = ind_files[-1] if ind_files else None
 
             build_hl_features(f, out_path, args.config, horizons,
-                              ind_path, bn_path, cb_path, asset)
+                              ind_path, bn_path, cb_path, asset,
+                              max_indicator_age_days=args.max_indicator_age_days)
 
     elif args.minute_parquet:
         basename = os.path.basename(args.minute_parquet)
@@ -727,6 +759,7 @@ def main():
             bn_path,
             cb_path,
             asset,
+            max_indicator_age_days=args.max_indicator_age_days,
         )
     else:
         ap.print_help()
