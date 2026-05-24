@@ -529,6 +529,22 @@ def add_time_features(df):
     d["is_europe_session"] = ((hour >= 7) & (hour < 16)).astype(int)
     d["hour_sin"] = np.sin(2 * np.pi * hour / 24)
     d["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+
+    # Funding-window features. HL pays funding every 8h at 00/08/16 UTC.
+    # Positioning predictably shifts in the 30-60min before payment (traders
+    # close to avoid paying funding, then reopen). Derivable from timestamp
+    # alone — works even when the indicator recorder is offline.
+    minute_of_day = hour * 60 + ts.dt.minute
+    funding_cycle_min = 8 * 60  # 480-minute cycle
+    mins_into_cycle = minute_of_day % funding_cycle_min  # 0..479
+    d["mins_since_last_funding"] = mins_into_cycle.astype(float)
+    d["mins_to_next_funding"] = (funding_cycle_min - mins_into_cycle).astype(float)
+    d["is_pre_funding_30m"] = (d["mins_to_next_funding"] <= 30).astype(int)
+    d["is_pre_funding_60m"] = (d["mins_to_next_funding"] <= 60).astype(int)
+    d["is_post_funding_30m"] = (d["mins_since_last_funding"] <= 30).astype(int)
+    # Cyclical encoding within the 8h funding cycle (smooth across boundary).
+    d["funding_cycle_sin"] = np.sin(2 * np.pi * mins_into_cycle / funding_cycle_min)
+    d["funding_cycle_cos"] = np.cos(2 * np.pi * mins_into_cycle / funding_cycle_min)
     return d
 
 # ═════════════════════════════════════════════════════════════════════════════
