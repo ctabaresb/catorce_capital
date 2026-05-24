@@ -317,7 +317,10 @@ def add_leadlag_features(df, bn_path, cb_path, asset):
             rename["n_ticks"] = f"{prefix}_n_ticks"
         if "flat_ratio" in kl.columns:
             rename["flat_ratio"] = f"{prefix}_flat_ratio"
-        if "uptick_ratio" in kl.columns:
+        if "uptick_ratio" in kl.columns and prefix != "bn":
+            # bn_uptick_ratio is in BANNED_EXACT (eth_binance recorder
+            # asymmetry, see wiki). Don't emit it from the source so the
+            # ban list isn't the only thing keeping it out of training.
             rename["uptick_ratio"] = f"{prefix}_uptick_ratio"
 
         kl_merge = kl[["ts_min"] + list(rename.keys())].rename(columns=rename)
