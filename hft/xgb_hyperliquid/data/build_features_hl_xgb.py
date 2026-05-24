@@ -513,6 +513,26 @@ def add_return_features(df):
     d["rv_pctile_240m"] = rv_30.rolling(240, min_periods=60).rank(pct=True)
     d["rv_pctile_1440m"] = rv_30.rolling(1440, min_periods=240).rank(pct=True)
 
+    # De-trended momentum (trend-vs-noise, "Sharpe of the recent move").
+    # Addresses the documented "predicts volatility but not direction" failure:
+    # without this, the model fires whenever rv is high regardless of which
+    # way price moved. trend_strength makes direction conditional on signal-
+    # to-noise. Per-minute vol is the natural denominator: scaling by sqrt(N)
+    # converts horizon-N return into per-minute standard-deviation units.
+    rv_5  = pd.to_numeric(d.get("rv_bps_5m"),  errors="coerce")
+    rv_10 = pd.to_numeric(d.get("rv_bps_10m"), errors="coerce")
+    rv_30 = pd.to_numeric(d.get("rv_bps_30m"), errors="coerce")
+    rv_60 = pd.to_numeric(d.get("rv_bps_60m"), errors="coerce")
+    for n, rv_window in [(5, rv_5), (10, rv_10), (30, rv_30)]:
+        ret = pd.to_numeric(d.get(f"ret_{n}m_bps"), errors="coerce")
+        d[f"trend_strength_{n}m"] = ret / (rv_window * np.sqrt(n) + 1e-12)
+    # Cross-window: short-horizon return scaled by long-horizon noise baseline
+    # (high values = directional move standing out vs long-run vol regime).
+    ret_5  = pd.to_numeric(d.get("ret_5m_bps"),  errors="coerce")
+    ret_15 = pd.to_numeric(d.get("ret_15m_bps"), errors="coerce")
+    d["trend_strength_5m_vs_60mvol"]  = ret_5  / (rv_60 * np.sqrt(5)  + 1e-12)
+    d["trend_strength_15m_vs_60mvol"] = ret_15 / (rv_60 * np.sqrt(15) + 1e-12)
+
     return d
 
 
