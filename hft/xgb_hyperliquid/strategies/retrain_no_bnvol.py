@@ -52,23 +52,24 @@ BANNED_EXACT = {
 } | BANNED_BN_VOL
 
 # (asset, direction, horizon, tp_bps, top_n_or_None, threshold)
-# v6 portfolio — 9 models validated on Apr 16-18 holdout (the regime that killed v5).
+# v7 portfolio — 7 models validated on May 18-21 holdout, confirmed on May 21-23 resv.
 # Selection: holdout mean_bps >= 2.30, n_trades >= 10, reserve mean_bps > 0.
-# Threshold picked by max(daily_bps) on val (Apr 13-15).
-# Direction: 2L / 7S — short-biased, tested in bearish regime.
+# Threshold picked by max(daily_bps) on val (May 15-18).
+# Direction: 5L / 2S — long-biased (training Mar 5 → May 15 was bullish for BTC/ETH).
+# Both shorts are BTC — ETH/SOL shorts didn't survive holdout in this regime.
+# All 7 maintained positive resv_mean despite May 21-23 being -3.8% to -5.8% across assets,
+# evidence of genuine short-horizon mean-reversion signal (not just trend-following).
 MODEL_DEFS = [
-    # BTC (4 models: 1L + 3S)
-    ("btc_usd", "long",  1, 0, 75,   0.82),   # hold: n=80  mean=+4.71 win=71% resv=+4.53
-    ("btc_usd", "short", 1, 0, 75,   0.86),   # hold: n=36  mean=+5.21 win=69% resv=+13.42
-    ("btc_usd", "short", 2, 0, 75,   0.82),   # hold: n=64  mean=+3.89 win=80% resv=+9.95
-    ("btc_usd", "short", 5, 0, 75,   0.82),   # hold: n=42  mean=+5.16 win=88% resv=+13.73
-    # ETH (2 models: 0L + 2S)
-    ("eth_usd", "short", 1, 0, 75,   0.82),   # hold: n=66  mean=+4.16 win=59% resv=+5.28
-    ("eth_usd", "short", 2, 0, None, 0.80),   # hold: n=53  mean=+5.46 win=74% resv=+0.62
-    # SOL (3 models: 1L + 2S)
-    ("sol_usd", "long",  1, 2, 75,   0.76),   # hold: n=143 mean=+3.03 win=62% resv=+2.04
-    ("sol_usd", "short", 1, 0, 75,   0.80),   # hold: n=141 mean=+4.27 win=63% resv=+5.88
-    ("sol_usd", "short", 2, 0, 75,   0.78),   # hold: n=133 mean=+3.37 win=69% resv=+4.66
+    # BTC (3 models: 1L + 2S)
+    ("btc_usd", "long",  2, 0, 75, 0.86),   # hold: n=14  mean=+2.37 win=71% resv=+3.12
+    ("btc_usd", "short", 1, 0, 75, 0.90),   # hold: n=19  mean=+3.03 win=63% resv=+3.12
+    ("btc_usd", "short", 2, 0, 75, 0.86),   # hold: n=23  mean=+2.68 win=70% resv=+1.51
+    # ETH (2 models: 2L + 0S)
+    ("eth_usd", "long",  1, 0, 75, 0.82),   # hold: n=71  mean=+2.52 win=63% resv=+1.15
+    ("eth_usd", "long",  2, 0, 75, 0.80),   # hold: n=86  mean=+2.79 win=71% resv=+1.90
+    # SOL (2 models: 2L + 0S)
+    ("sol_usd", "long",  1, 0, 75, 0.80),   # hold: n=116 mean=+2.70 win=63% resv=+4.13
+    ("sol_usd", "long",  1, 2, 75, 0.84),   # hold: n=40  mean=+6.27 win=75% resv=+11.21
 ]
 
 ASSET_TO_DIR = {"btc_usd": "btc", "eth_usd": "eth", "sol_usd": "sol"}
@@ -208,9 +209,9 @@ def train_and_export(df, feature_cols, target_col, direction, horizon, out_dir, 
 
 
 def main():
-    # v5: export to its own directory to avoid mixing with live v3 models.
+    # Export to a versioned directory to avoid mixing with prior live models.
     # Bot's --models_dir must be updated to this path at deploy time.
-    out_base = "models/live_v6"
+    out_base = "models/live_v7"
 
     assets = {}
     for asset, direction, horizon, tp, top_n, thr in MODEL_DEFS:
