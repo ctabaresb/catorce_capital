@@ -78,12 +78,13 @@ class ModelConfig:
     threshold: float           # prediction threshold for trade entry
     model_dir: str             # path to model files
     coin: str = "BTC"          # which coin this model trades
+    tp_bps: int = 0            # take-profit target in bps (from meta.json)
     models: List = field(default_factory=list)
     feature_names: List[str] = field(default_factory=list)
     medians: Dict[str, float] = field(default_factory=dict)
 
     def load(self):
-        """Load ensemble models + feature list + medians from disk."""
+        """Load ensemble models + feature list + medians + meta from disk."""
         # Load feature names
         feat_path = os.path.join(self.model_dir, "features.json")
         with open(feat_path) as f:
@@ -93,6 +94,13 @@ class ModelConfig:
         med_path = os.path.join(self.model_dir, "medians.json")
         with open(med_path) as f:
             self.medians = json.load(f)
+
+        # Load meta for tp_bps (used by early-exit logic)
+        meta_path = os.path.join(self.model_dir, "meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            self.tp_bps = int(meta.get("tp_bps", 0))
 
         # Load XGB models
         self.models = []
@@ -104,7 +112,8 @@ class ModelConfig:
                 self.models.append(m)
 
         logger.info(f"Loaded {self.name}: {len(self.models)} models, "
-                    f"{len(self.feature_names)} features, thr={self.threshold}")
+                    f"{len(self.feature_names)} features, thr={self.threshold}, "
+                    f"tp={self.tp_bps}bps")
 
     def predict(self, features: Dict[str, float]) -> float:
         """Run ensemble prediction. Returns averaged probability."""
@@ -357,6 +366,7 @@ class Position:
     entry_px: float
     size: float               # In coin units
     horizon_m: int
+    tp_bps: int = 0           # target the model trained on (net of fees)
     exit_oid: Optional[int] = None
     exit_posted_time: Optional[float] = None
     state: str = "open"       # open, exiting, closed
@@ -672,6 +682,7 @@ class XGBBot:
                 model_name=mc.name, direction=mc.direction,
                 coin=mc.coin, entry_time=now, entry_px=mid,
                 size=size_coin, horizon_m=mc.horizon_m,
+                tp_bps=mc.tp_bps,
                 state="open",
             ))
         else:
@@ -686,6 +697,7 @@ class XGBBot:
                     model_name=mc.name, direction=mc.direction,
                     coin=mc.coin, entry_time=now, entry_px=fill_px,
                     size=size_coin, horizon_m=mc.horizon_m,
+                    tp_bps=mc.tp_bps,
                     state="open",
                 ))
                 send_telegram(
@@ -713,6 +725,23 @@ class XGBBot:
             mid = engine._buffer[-1].mid if engine and engine._buffer else 0
 
             hold_minutes = (now - pos.entry_time) / 60.0
+
+            # Early breakeven / TP exit: models trained on MFE target
+            # (target_long_{tp}bp_h = "did NET return reach >= tp bps within
+            # horizon?"). Default horizon-expiry exit captures whatever the
+            # price reverted to. Exiting at first moment net_bps >= tp_bps
+            # locks in what the model was actually trained to predict.
+            # Skip if we don't have a valid mid yet, and require minimum
+            # 30s hold to avoid noise-driven exits on the very first tick.
+            if mid > 0 and hold_minutes >= 0.5 and hold_minutes < pos.horizon_m:
+                if pos.direction == "long":
+                    gross_bps = (mid / (pos.entry_px + 1e-12) - 1) * 1e4
+                else:
+                    gross_bps = (pos.entry_px / (mid + 1e-12) - 1) * 1e4
+                net_bps_est = gross_bps - 4.59  # RT fee, matches _exit_position
+                if net_bps_est >= pos.tp_bps:
+                    self._exit_position(pos, mid, "tp_hit")
+                    continue
 
             # Check if horizon has elapsed
             if hold_minutes >= pos.horizon_m:
