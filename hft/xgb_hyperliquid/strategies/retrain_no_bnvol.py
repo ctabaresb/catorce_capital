@@ -218,8 +218,11 @@ def main():
             assets[asset] = []
         assets[asset].append((direction, horizon, tp, top_n, thr))
 
+    # v7: switched to 80d suffix to match the current download window. Edit
+    # this constant if you re-download with a different --days value.
+    days_suffix = "80d"
     for asset, models in assets.items():
-        parquet = f"data/artifacts_xgb/xgb_features_hyperliquid_{asset}_180d.parquet"
+        parquet = f"data/artifacts_xgb/xgb_features_hyperliquid_{asset}_{days_suffix}.parquet"
         asset_dir = ASSET_TO_DIR[asset]
         out_dir = os.path.join(out_base, asset_dir)
 
