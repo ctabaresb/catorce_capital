@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-xgb_bot.py — Live XGB Trading Bot for Hyperliquid (V6 Multi-Asset)
+xgb_bot.py — Live XGB Trading Bot for Hyperliquid (V7 Multi-Asset)
 
-Runs 9 models across BTC, ETH, SOL:
-  BTC: long_1m_tp0 (0.82), short_1m_tp0 (0.86), short_2m_tp0 (0.82), short_5m_tp0 (0.82)
-  ETH: short_1m_tp0 (0.82), short_2m_tp0 (0.80)
-  SOL: long_1m_tp2 (0.76), short_1m_tp0 (0.80), short_2m_tp0 (0.78)
+Runs 7 models across BTC, ETH, SOL:
+  BTC: long_2m_tp0 (0.86), short_1m_tp0 (0.90), short_2m_tp0 (0.86)
+  ETH: long_1m_tp0 (0.82), long_2m_tp0 (0.80)
+  SOL: long_1m_tp0 (0.80), long_1m_tp2 (0.84)
 
-v6 changes vs v5:
-  - Trained on Mar 5 → Apr 12 (38 days, includes uptrend + downtrend)
-  - Holdout on Apr 16-18 (the regime that killed v5 — all 9 configs profitable)
-  - Reserve confirmed on Apr 19-20 (all 9 configs positive)
-  - Direction: 2L/7S (short-biased, tested in bearish conditions)
-  - All thresholds 0.76-0.86 (shorts can actually fire now)
-  - Tick features computed from REST trade data (not median-imputed)
+v7 changes vs v6:
+  - Trained on Mar 5 → May 15 (71 days, includes mid-March bull, mid-May chop)
+  - Holdout on May 18-21 (all 7 ship configs profitable)
+  - Reserve confirmed on May 21-23 (the bearish window — all 7 still positive)
+  - Direction: 5L/2S (long-biased; ETH/SOL shorts didn't survive May regime)
+  - Thresholds 0.80-0.90 (higher than v6)
+  - Indicator features ALIVE (snapshot-backfilled the Mar 25 → today gap)
+  - NEW exit logic: tp_hit early-exit when net_bps >= tp_bps (captures the
+    MFE the model was trained to predict instead of waiting for horizon expiry)
+  - NEW features: trend_strength_30m, trend_strength_5m_vs_60mvol (de-trended
+    momentum, addresses "predicts vol not direction" failure mode)
 
 Architecture:
   Every 60s: fetch HL + Binance + Coinbase data per coin
-  → compute features → predict with 9 XGB ensembles
+  → compute features → predict with 7 XGB ensembles
   → if prediction > threshold → execute on HL
+  → exit on net_bps >= tp_bps OR horizon expiry (whichever first)
 
 Shadow mode (default): predicts and logs but does NOT place orders.
 Live mode: places real orders on Hyperliquid.
@@ -867,7 +872,7 @@ def main():
                       help="Live mode: real orders on Hyperliquid")
     ap.add_argument("--size", type=float, default=100,
                     help="Position size in USD per trade (default $100)")
-    ap.add_argument("--models_dir", default="models/live_v6",
+    ap.add_argument("--models_dir", default="models/live_v7",
                     help="Directory containing model subdirectories")
     ap.add_argument("--max_loss", type=float, default=50,
                     help="Max cumulative loss before halt (USD)")
@@ -888,56 +893,48 @@ def main():
 
     shadow = not args.live
 
-    # Define model configs (V6: holdout-validated on Apr 16-18 bearish regime)
-    # 9 models: 2L/7S, all reserve-confirmed, thresholds 0.76-0.86.
+    # Define model configs (V7: holdout-validated on May 18-21, reserve-
+    # confirmed on May 21-23 bearish window). 7 models: 5L/2S, both shorts
+    # are BTC. Thresholds 0.80-0.90. See retrain_no_bnvol.py MODEL_DEFS for
+    # the canonical list and holdout metrics.
     model_configs = [
-        # BTC models (4): 1 long + 3 short
+        # BTC (3): 1 long + 2 short
         ModelConfig(
-            name="btc_long_1m_tp0",
-            direction="long", horizon_m=1, threshold=0.82, coin="BTC",
-            model_dir=os.path.join(args.models_dir, "btc", "long_1m_tp0"),
+            name="btc_long_2m_tp0",
+            direction="long", horizon_m=2, threshold=0.86, coin="BTC",
+            model_dir=os.path.join(args.models_dir, "btc", "long_2m_tp0"),
         ),
         ModelConfig(
             name="btc_short_1m_tp0",
-            direction="short", horizon_m=1, threshold=0.86, coin="BTC",
+            direction="short", horizon_m=1, threshold=0.90, coin="BTC",
             model_dir=os.path.join(args.models_dir, "btc", "short_1m_tp0"),
         ),
         ModelConfig(
             name="btc_short_2m_tp0",
-            direction="short", horizon_m=2, threshold=0.82, coin="BTC",
+            direction="short", horizon_m=2, threshold=0.86, coin="BTC",
             model_dir=os.path.join(args.models_dir, "btc", "short_2m_tp0"),
         ),
+        # ETH (2): 2 long
         ModelConfig(
-            name="btc_short_5m_tp0",
-            direction="short", horizon_m=5, threshold=0.82, coin="BTC",
-            model_dir=os.path.join(args.models_dir, "btc", "short_5m_tp0"),
-        ),
-        # ETH models (2): 0 long + 2 short
-        ModelConfig(
-            name="eth_short_1m_tp0",
-            direction="short", horizon_m=1, threshold=0.82, coin="ETH",
-            model_dir=os.path.join(args.models_dir, "eth", "short_1m_tp0"),
+            name="eth_long_1m_tp0",
+            direction="long", horizon_m=1, threshold=0.82, coin="ETH",
+            model_dir=os.path.join(args.models_dir, "eth", "long_1m_tp0"),
         ),
         ModelConfig(
-            name="eth_short_2m_tp0",
-            direction="short", horizon_m=2, threshold=0.80, coin="ETH",
-            model_dir=os.path.join(args.models_dir, "eth", "short_2m_tp0"),
+            name="eth_long_2m_tp0",
+            direction="long", horizon_m=2, threshold=0.80, coin="ETH",
+            model_dir=os.path.join(args.models_dir, "eth", "long_2m_tp0"),
         ),
-        # SOL models (3): 1 long + 2 short
+        # SOL (2): 2 long
+        ModelConfig(
+            name="sol_long_1m_tp0",
+            direction="long", horizon_m=1, threshold=0.80, coin="SOL",
+            model_dir=os.path.join(args.models_dir, "sol", "long_1m_tp0"),
+        ),
         ModelConfig(
             name="sol_long_1m_tp2",
-            direction="long", horizon_m=1, threshold=0.76, coin="SOL",
+            direction="long", horizon_m=1, threshold=0.84, coin="SOL",
             model_dir=os.path.join(args.models_dir, "sol", "long_1m_tp2"),
-        ),
-        ModelConfig(
-            name="sol_short_1m_tp0",
-            direction="short", horizon_m=1, threshold=0.80, coin="SOL",
-            model_dir=os.path.join(args.models_dir, "sol", "short_1m_tp0"),
-        ),
-        ModelConfig(
-            name="sol_short_2m_tp0",
-            direction="short", horizon_m=2, threshold=0.78, coin="SOL",
-            model_dir=os.path.join(args.models_dir, "sol", "short_2m_tp0"),
         ),
     ]
 
