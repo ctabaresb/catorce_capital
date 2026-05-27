@@ -743,7 +743,7 @@ class XGBBot:
                     gross_bps = (mid / (pos.entry_px + 1e-12) - 1) * 1e4
                 else:
                     gross_bps = (pos.entry_px / (mid + 1e-12) - 1) * 1e4
-                net_bps_est = gross_bps - 4.59  # RT fee, matches _exit_position
+                net_bps_est = gross_bps - 6.48  # RT taker+taker, matches _exit_position
                 if net_bps_est >= pos.tp_bps:
                     self._exit_position(pos, mid, "tp_hit")
                     continue
@@ -768,9 +768,14 @@ class XGBBot:
         else:
             gross_bps = (pos.entry_px / (current_mid + 1e-12) - 1) * 1e4
 
-        # Cost: taker entry (4.05 bps) + maker exit (1.35 bps) = 5.4 bps
-        # Cost: taker entry (3.24 bps) + maker exit (1.35 bps) = 4.59 bps
-        cost_bps = 4.59
+        # Cost: bot's _exit_position uses self.hl_client.market_order (taker).
+        # Real RT cost is TAKER on both sides for BTC/ETH/SOL aligned perps:
+        #   taker per side = base 4.5 bps × 0.9 (10% staking) × 0.8 (aligned) = 3.24 bps
+        #   RT = 3.24 × 2 = 6.48 bps
+        # (Theoretical taker+maker would be 4.59 bps, but exit is market_close
+        # not a limit, so we pay taker both sides. Activating the 4% referral
+        # would drop this to 6.22 bps RT.)
+        cost_bps = 6.48
         net_bps = gross_bps - cost_bps
         pnl_usd = net_bps / 1e4 * self.size_usd
 
