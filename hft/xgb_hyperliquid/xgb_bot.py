@@ -253,8 +253,25 @@ class HLClient:
             return 0.0
 
     def get_equity(self) -> float:
+        # With HL Unified Account enabled, spot USDC is usable as perp margin —
+        # no spot→perp transfer is needed and the UI's transfer button is
+        # disabled. marginSummary.accountValue only reflects perps-side state
+        # (positions + locked margin); it reads $0 when no perp positions are
+        # open even though spot USDC is fully available as collateral.
+        # Sum both for the true tradeable equity.
         state = self.info.user_state(self.wallet_address)
-        return float(state.get("marginSummary", {}).get("accountValue", 0))
+        perp_value = float(state.get("marginSummary", {}).get("accountValue", 0))
+        try:
+            spot = self.info.spot_user_state(self.wallet_address)
+            spot_usdc = 0.0
+            for b in spot.get("balances", []):
+                if b.get("coin") == "USDC":
+                    spot_usdc = float(b.get("total", 0))
+                    break
+            return perp_value + spot_usdc
+        except Exception as e:
+            logger.warning(f"spot balance fetch failed, falling back to perp only: {e}")
+            return perp_value
 
     def get_positions(self) -> List[dict]:
         state = self.info.user_state(self.wallet_address)
