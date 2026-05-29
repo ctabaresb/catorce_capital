@@ -40,7 +40,7 @@ from sklearn.metrics import (
 # v5: import lazy target computation
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
-from data.targets import compute_targets, COST_REAL  # noqa: E402
+from data.targets import compute_targets, COST_OBSERVED  # noqa: E402
 
 try:
     from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
@@ -619,10 +619,13 @@ def main():
               f"{before:,} -> {len(df):,} rows "
               f"({df['ts_min'].min().date()} -> {df['ts_min'].max().date()})")
 
-    # v5: compute targets lazily with COST_REAL (4.59 bps RT: 3.24 taker + 1.35 maker).
-    # Targets are NOT in the feature parquet anymore — must be computed here.
-    print(f"  Computing targets: {COST_REAL.describe()}")
-    df = compute_targets(df, cost=COST_REAL)
+    # v8: compute targets lazily with COST_OBSERVED (8.10 bps RT, taker+taker
+    # using the user-displayed 4.05 bps rate). v3-v7 used COST_REAL (4.59) which
+    # under-stated cost by 3.5 bps because the bot does market_close on exit
+    # (taker), not maker as the wiki name "REAL" implied. See data/targets.py
+    # docstring for the full history.
+    print(f"  Computing targets: {COST_OBSERVED.describe()}")
+    df = compute_targets(df, cost=COST_OBSERVED)
     print(f"  After targets: {df.shape[1]} cols")
 
     all_feature_cols = get_feature_columns(df)

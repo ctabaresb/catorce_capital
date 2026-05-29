@@ -41,7 +41,7 @@ import xgboost as xgb
 # ── Repo-relative imports (data/targets.py) ──────────────────────────────────
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
-from data.targets import compute_targets, COST_REAL  # noqa: E402
+from data.targets import compute_targets, COST_OBSERVED  # noqa: E402
 
 warnings.filterwarnings("ignore")
 RANDOM_SEED = 42
@@ -223,7 +223,7 @@ def evaluate_one_config(asset, direction, horizon, tp, feat_set,
     df = pd.read_parquet(parquet)
     df["ts_min"] = pd.to_datetime(df["ts_min"], utc=True)
     df = df.sort_values("ts_min").reset_index(drop=True)
-    df = compute_targets(df, cost=COST_REAL)
+    df = compute_targets(df, cost=COST_OBSERVED)  # v8: 8.10 bps RT (taker+taker)
 
     target_col = f"target_{direction}_{tp}bp_{horizon}m"
     valid_col = f"fwd_valid_mfe_{horizon}m"
