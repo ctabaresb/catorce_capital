@@ -79,9 +79,22 @@ class CostModel:
 
 
 # Preset cost models
-COST_REAL = CostModel(3.24, 1.35, 0.0)          # 4.59 bps RT (measured)
-COST_CONSERVATIVE = CostModel(3.24, 1.35, 0.81) # 5.40 bps RT (v3 behavior)
-COST_WORSTCASE = CostModel(3.24, 3.24, 0.0)     # 6.48 bps RT (taker+taker)
+#
+# Naming history: COST_REAL was named under the (incorrect) assumption that
+# the bot used taker entry + maker exit. The bot's _exit_position actually
+# calls market_order = taker on BOTH sides, so the real cost path for v3-v7
+# was COST_WORSTCASE (6.48 bps RT after aligned-quote 0.8x scale on taker).
+#
+# COST_OBSERVED (v8) uses the user-displayed taker/maker rates from the HL
+# UI verbatim (4.05/1.35 bps per side, post-staking, pre-aligned-quote
+# scale). The 0.8x aligned-quote discount IS applied at execution for
+# BTC/ETH/SOL perps in practice, so this preset is conservative — models
+# trained against 8.10 get a ~1.62 bps hidden cushion when live cost
+# resolves to 6.48. v8 sweep + holdout + retrain should use this.
+COST_REAL = CostModel(3.24, 1.35, 0.0)          # 4.59 bps RT (theoretical taker+maker, NOT bot reality)
+COST_CONSERVATIVE = CostModel(3.24, 1.35, 0.81) # 5.40 bps RT (v3-era buffer)
+COST_WORSTCASE = CostModel(3.24, 3.24, 0.0)     # 6.48 bps RT (taker+taker with aligned scale — bot actual)
+COST_OBSERVED = CostModel(4.05, 4.05, 0.0)      # 8.10 bps RT (taker+taker, no aligned scale — v8 conservative)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

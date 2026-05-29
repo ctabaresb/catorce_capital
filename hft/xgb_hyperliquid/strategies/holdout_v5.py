@@ -41,7 +41,7 @@ import xgboost as xgb
 # ── Repo-relative imports (data/targets.py) ──────────────────────────────────
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
-from data.targets import compute_targets, COST_REAL  # noqa: E402
+from data.targets import compute_targets, COST_OBSERVED  # noqa: E402
 
 warnings.filterwarnings("ignore")
 RANDOM_SEED = 42
@@ -213,9 +213,9 @@ def evaluate_on_period(probs, pnl, n_days_period, thr):
 
 
 def evaluate_one_config(asset, direction, horizon, tp, feat_set,
-                        features_dir, log_prefix=""):
+                        features_dir, days_suffix="180d", log_prefix=""):
     """Train on Mar 8-Apr 5, pick thr on Apr 6-8 val, evaluate on Apr 9-11 hold + Apr 12-15 reserve."""
-    parquet = Path(features_dir) / f"xgb_features_hyperliquid_{asset}_180d.parquet"
+    parquet = Path(features_dir) / f"xgb_features_hyperliquid_{asset}_{days_suffix}.parquet"
     if not parquet.exists():
         print(f"{log_prefix}MISSING parquet: {parquet}")
         return None
@@ -223,7 +223,7 @@ def evaluate_one_config(asset, direction, horizon, tp, feat_set,
     df = pd.read_parquet(parquet)
     df["ts_min"] = pd.to_datetime(df["ts_min"], utc=True)
     df = df.sort_values("ts_min").reset_index(drop=True)
-    df = compute_targets(df, cost=COST_REAL)
+    df = compute_targets(df, cost=COST_OBSERVED)  # v8: 8.10 bps RT (taker+taker)
 
     target_col = f"target_{direction}_{tp}bp_{horizon}m"
     valid_col = f"fwd_valid_mfe_{horizon}m"
@@ -373,6 +373,10 @@ def main():
                     help="Holdout data in [val_end, hold_end)")
     ap.add_argument("--resv_end", default="2026-04-21",
                     help="Reserve data in [hold_end, resv_end)")
+    ap.add_argument("--days_suffix", default="180d",
+                    help="Filename suffix of the XGB parquet to load (e.g. 80d, "
+                         "180d). Default 180d for back-compat. Filename is "
+                         "xgb_features_hyperliquid_{asset}_{days_suffix}.parquet.")
     args = ap.parse_args()
 
     # Override globals with CLI args
@@ -442,6 +446,7 @@ def main():
             horizon=int(row["horizon"]), tp=int(row["tp_bps"]),
             feat_set=row["feat_set"],
             features_dir=args.features_dir,
+            days_suffix=args.days_suffix,
             log_prefix=prefix,
         )
         if res is None:
@@ -477,6 +482,10 @@ def main():
     print(f"\n{'='*78}")
     print(f"  SUMMARY")
     print(f"{'='*78}")
+    if df.empty or "ships" not in df.columns:
+        print(f"  No configs evaluated (all INSUFFICIENT or errored). "
+              f"Check parquet path and date ranges.")
+        return
     n_ships = int(df["ships"].sum())
     print(f"  Total configs: {len(df)}")
     print(f"  Ships (holdout >= 2.30 bps, n >= 10): {n_ships}/{len(df)}")

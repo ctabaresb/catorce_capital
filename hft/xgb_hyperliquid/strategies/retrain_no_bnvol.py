@@ -13,7 +13,7 @@ import xgboost as xgb
 # v5: import lazy target computation from data/targets.py
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
-from data.targets import compute_targets, COST_REAL, TargetSpec  # noqa: E402
+from data.targets import compute_targets, COST_OBSERVED, TargetSpec  # noqa: E402
 
 warnings.filterwarnings("ignore")
 RANDOM_SEED = 42
@@ -52,23 +52,24 @@ BANNED_EXACT = {
 } | BANNED_BN_VOL
 
 # (asset, direction, horizon, tp_bps, top_n_or_None, threshold)
-# v6 portfolio — 9 models validated on Apr 16-18 holdout (the regime that killed v5).
+# v7 portfolio — 7 models validated on May 18-21 holdout, confirmed on May 21-23 resv.
 # Selection: holdout mean_bps >= 2.30, n_trades >= 10, reserve mean_bps > 0.
-# Threshold picked by max(daily_bps) on val (Apr 13-15).
-# Direction: 2L / 7S — short-biased, tested in bearish regime.
+# Threshold picked by max(daily_bps) on val (May 15-18).
+# Direction: 5L / 2S — long-biased (training Mar 5 → May 15 was bullish for BTC/ETH).
+# Both shorts are BTC — ETH/SOL shorts didn't survive holdout in this regime.
+# All 7 maintained positive resv_mean despite May 21-23 being -3.8% to -5.8% across assets,
+# evidence of genuine short-horizon mean-reversion signal (not just trend-following).
 MODEL_DEFS = [
-    # BTC (4 models: 1L + 3S)
-    ("btc_usd", "long",  1, 0, 75,   0.82),   # hold: n=80  mean=+4.71 win=71% resv=+4.53
-    ("btc_usd", "short", 1, 0, 75,   0.86),   # hold: n=36  mean=+5.21 win=69% resv=+13.42
-    ("btc_usd", "short", 2, 0, 75,   0.82),   # hold: n=64  mean=+3.89 win=80% resv=+9.95
-    ("btc_usd", "short", 5, 0, 75,   0.82),   # hold: n=42  mean=+5.16 win=88% resv=+13.73
-    # ETH (2 models: 0L + 2S)
-    ("eth_usd", "short", 1, 0, 75,   0.82),   # hold: n=66  mean=+4.16 win=59% resv=+5.28
-    ("eth_usd", "short", 2, 0, None, 0.80),   # hold: n=53  mean=+5.46 win=74% resv=+0.62
-    # SOL (3 models: 1L + 2S)
-    ("sol_usd", "long",  1, 2, 75,   0.76),   # hold: n=143 mean=+3.03 win=62% resv=+2.04
-    ("sol_usd", "short", 1, 0, 75,   0.80),   # hold: n=141 mean=+4.27 win=63% resv=+5.88
-    ("sol_usd", "short", 2, 0, 75,   0.78),   # hold: n=133 mean=+3.37 win=69% resv=+4.66
+    # BTC (3 models: 1L + 2S)
+    ("btc_usd", "long",  2, 0, 75, 0.86),   # hold: n=14  mean=+2.37 win=71% resv=+3.12
+    ("btc_usd", "short", 1, 0, 75, 0.90),   # hold: n=19  mean=+3.03 win=63% resv=+3.12
+    ("btc_usd", "short", 2, 0, 75, 0.86),   # hold: n=23  mean=+2.68 win=70% resv=+1.51
+    # ETH (2 models: 2L + 0S)
+    ("eth_usd", "long",  1, 0, 75, 0.82),   # hold: n=71  mean=+2.52 win=63% resv=+1.15
+    ("eth_usd", "long",  2, 0, 75, 0.80),   # hold: n=86  mean=+2.79 win=71% resv=+1.90
+    # SOL (2 models: 2L + 0S)
+    ("sol_usd", "long",  1, 0, 75, 0.80),   # hold: n=116 mean=+2.70 win=63% resv=+4.13
+    ("sol_usd", "long",  1, 2, 75, 0.84),   # hold: n=40  mean=+6.27 win=75% resv=+11.21
 ]
 
 ASSET_TO_DIR = {"btc_usd": "btc", "eth_usd": "eth", "sol_usd": "sol"}
@@ -192,11 +193,11 @@ def train_and_export(df, feature_cols, target_col, direction, horizon, out_dir, 
         "direction": direction, "horizon_m": horizon, "tp_bps": tp_bps,
         "n_features": len(feature_cols), "n_train": len(train_d),
         "base_rate": float(y_tr.mean()),
-        # v5: cost breakdown from data/targets.py::COST_REAL
-        "entry_fee_bps": COST_REAL.entry_fee_bps,
-        "exit_fee_bps": COST_REAL.exit_fee_bps,
-        "extra_buffer_bps": COST_REAL.extra_buffer_bps,
-        "rt_cost_bps": COST_REAL.rt_bps,
+        # v8: cost breakdown from data/targets.py::COST_OBSERVED (8.10 RT)
+        "entry_fee_bps": COST_OBSERVED.entry_fee_bps,
+        "exit_fee_bps": COST_OBSERVED.exit_fee_bps,
+        "extra_buffer_bps": COST_OBSERVED.extra_buffer_bps,
+        "rt_cost_bps": COST_OBSERVED.rt_bps,
         "target_version": "v5_bidask",
         "excluded": sorted(BANNED_BN_VOL),
         "train_date": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
@@ -208,9 +209,9 @@ def train_and_export(df, feature_cols, target_col, direction, horizon, out_dir, 
 
 
 def main():
-    # v5: export to its own directory to avoid mixing with live v3 models.
+    # Export to a versioned directory to avoid mixing with prior live models.
     # Bot's --models_dir must be updated to this path at deploy time.
-    out_base = "models/live_v6"
+    out_base = "models/live_v7"
 
     assets = {}
     for asset, direction, horizon, tp, top_n, thr in MODEL_DEFS:
@@ -218,8 +219,11 @@ def main():
             assets[asset] = []
         assets[asset].append((direction, horizon, tp, top_n, thr))
 
+    # v7: switched to 80d suffix to match the current download window. Edit
+    # this constant if you re-download with a different --days value.
+    days_suffix = "80d"
     for asset, models in assets.items():
-        parquet = f"data/artifacts_xgb/xgb_features_hyperliquid_{asset}_180d.parquet"
+        parquet = f"data/artifacts_xgb/xgb_features_hyperliquid_{asset}_{days_suffix}.parquet"
         asset_dir = ASSET_TO_DIR[asset]
         out_dir = os.path.join(out_base, asset_dir)
 
@@ -231,9 +235,9 @@ def main():
         df["ts_min"] = pd.to_datetime(df["ts_min"], utc=True)
         print(f"  Loaded: {df.shape[0]:,} rows x {df.shape[1]} cols")
 
-        # v5: compute targets lazily — feature parquet no longer contains them
-        print(f"  Computing targets lazily with cost={COST_REAL.describe()}")
-        df = compute_targets(df, cost=COST_REAL)
+        # v8: compute targets lazily with COST_OBSERVED (8.10 bps RT)
+        print(f"  Computing targets lazily with cost={COST_OBSERVED.describe()}")
+        df = compute_targets(df, cost=COST_OBSERVED)
         print(f"  After targets: {df.shape[0]:,} rows x {df.shape[1]} cols")
 
         all_features = get_feature_columns(df)

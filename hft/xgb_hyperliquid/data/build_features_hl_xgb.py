@@ -317,7 +317,10 @@ def add_leadlag_features(df, bn_path, cb_path, asset):
             rename["n_ticks"] = f"{prefix}_n_ticks"
         if "flat_ratio" in kl.columns:
             rename["flat_ratio"] = f"{prefix}_flat_ratio"
-        if "uptick_ratio" in kl.columns:
+        if "uptick_ratio" in kl.columns and prefix != "bn":
+            # bn_uptick_ratio is in BANNED_EXACT (eth_binance recorder
+            # asymmetry, see wiki). Don't emit it from the source so the
+            # ban list isn't the only thing keeping it out of training.
             rename["uptick_ratio"] = f"{prefix}_uptick_ratio"
 
         kl_merge = kl[["ts_min"] + list(rename.keys())].rename(columns=rename)
@@ -510,6 +513,26 @@ def add_return_features(df):
     d["rv_pctile_240m"] = rv_30.rolling(240, min_periods=60).rank(pct=True)
     d["rv_pctile_1440m"] = rv_30.rolling(1440, min_periods=240).rank(pct=True)
 
+    # De-trended momentum (trend-vs-noise, "Sharpe of the recent move").
+    # Addresses the documented "predicts volatility but not direction" failure:
+    # without this, the model fires whenever rv is high regardless of which
+    # way price moved. trend_strength makes direction conditional on signal-
+    # to-noise. Per-minute vol is the natural denominator: scaling by sqrt(N)
+    # converts horizon-N return into per-minute standard-deviation units.
+    rv_5  = pd.to_numeric(d.get("rv_bps_5m"),  errors="coerce")
+    rv_10 = pd.to_numeric(d.get("rv_bps_10m"), errors="coerce")
+    rv_30 = pd.to_numeric(d.get("rv_bps_30m"), errors="coerce")
+    rv_60 = pd.to_numeric(d.get("rv_bps_60m"), errors="coerce")
+    for n, rv_window in [(5, rv_5), (10, rv_10), (30, rv_30)]:
+        ret = pd.to_numeric(d.get(f"ret_{n}m_bps"), errors="coerce")
+        d[f"trend_strength_{n}m"] = ret / (rv_window * np.sqrt(n) + 1e-12)
+    # Cross-window: short-horizon return scaled by long-horizon noise baseline
+    # (high values = directional move standing out vs long-run vol regime).
+    ret_5  = pd.to_numeric(d.get("ret_5m_bps"),  errors="coerce")
+    ret_15 = pd.to_numeric(d.get("ret_15m_bps"), errors="coerce")
+    d["trend_strength_5m_vs_60mvol"]  = ret_5  / (rv_60 * np.sqrt(5)  + 1e-12)
+    d["trend_strength_15m_vs_60mvol"] = ret_15 / (rv_60 * np.sqrt(15) + 1e-12)
+
     return d
 
 
@@ -526,6 +549,22 @@ def add_time_features(df):
     d["is_europe_session"] = ((hour >= 7) & (hour < 16)).astype(int)
     d["hour_sin"] = np.sin(2 * np.pi * hour / 24)
     d["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+
+    # Funding-window features. HL pays funding every 8h at 00/08/16 UTC.
+    # Positioning predictably shifts in the 30-60min before payment (traders
+    # close to avoid paying funding, then reopen). Derivable from timestamp
+    # alone — works even when the indicator recorder is offline.
+    minute_of_day = hour * 60 + ts.dt.minute
+    funding_cycle_min = 8 * 60  # 480-minute cycle
+    mins_into_cycle = minute_of_day % funding_cycle_min  # 0..479
+    d["mins_since_last_funding"] = mins_into_cycle.astype(float)
+    d["mins_to_next_funding"] = (funding_cycle_min - mins_into_cycle).astype(float)
+    d["is_pre_funding_30m"] = (d["mins_to_next_funding"] <= 30).astype(int)
+    d["is_pre_funding_60m"] = (d["mins_to_next_funding"] <= 60).astype(int)
+    d["is_post_funding_30m"] = (d["mins_since_last_funding"] <= 30).astype(int)
+    # Cyclical encoding within the 8h funding cycle (smooth across boundary).
+    d["funding_cycle_sin"] = np.sin(2 * np.pi * mins_into_cycle / funding_cycle_min)
+    d["funding_cycle_cos"] = np.cos(2 * np.pi * mins_into_cycle / funding_cycle_min)
     return d
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -535,13 +574,20 @@ def add_time_features(df):
 def build_hl_features(minute_path, output_path, config_path=None,
                       horizons_m=None,
                       indicator_path=None, bn_path=None, cb_path=None,
-                      asset="btc_usd"):
+                      asset="btc_usd",
+                      max_indicator_age_days=7):
     """
     v5: Pure feature builder. No targets — those are computed lazily at
     train/sweep time via data/targets.py (bid/ask-aware, parameterized cost).
 
     horizons_m is accepted for back-compat but unused (it belonged to target
     construction, which no longer happens here).
+
+    max_indicator_age_days: drop the entire hl_* feature group if the
+    indicator parquet's latest timestamp is older than this threshold
+    relative to the feature data. Prevents the model from learning split
+    thresholds on a small unrepresentative sample (e.g., when the metrics
+    recorder has stopped and most rows have NaN). Default 7 days.
     """
     if horizons_m is None:
         horizons_m = [1, 2, 5, 10]
@@ -573,11 +619,30 @@ def build_hl_features(minute_path, output_path, config_path=None,
 
     df = df.sort_values("ts_min").reset_index(drop=True)
 
-    # Load indicator data
+    # Load indicator data — gated by freshness so we don't merge mostly-NaN
+    # features and teach the model brittle splits on a small unrepresentative
+    # sample of valid hl_* values.
     ind_df = None
     if indicator_path and os.path.exists(indicator_path):
-        ind_df = pd.read_parquet(indicator_path)
-        print(f"  Indicators: {len(ind_df):,} rows x {ind_df.shape[1]} cols")
+        _raw_ind = pd.read_parquet(indicator_path)
+        _ts_col = next((c for c in ["timestamp_utc", "ts", "timestamp", "time", "dt"]
+                        if c in _raw_ind.columns), None)
+        if _ts_col is None:
+            print(f"  Indicators: no timestamp column found, SKIPPING hl_* features")
+        else:
+            ind_max = pd.to_datetime(_raw_ind[_ts_col], utc=True, errors="coerce").max()
+            feat_max = pd.to_datetime(df["ts_min"], utc=True, errors="coerce").max()
+            age_days = (feat_max - ind_max).total_seconds() / 86400.0
+            if age_days > max_indicator_age_days:
+                print(f"  Indicators stale by {age_days:.1f}d "
+                      f"(threshold: {max_indicator_age_days}d) — "
+                      f"SKIPPING hl_* features entirely")
+                print(f"    latest indicator ts: {ind_max}")
+                print(f"    latest feature ts:   {feat_max}")
+            else:
+                ind_df = _raw_ind
+                print(f"  Indicators: {len(ind_df):,} rows x {ind_df.shape[1]} cols "
+                      f"(latest {age_days:.1f}d old)")
 
     # ── Step 1: DOM velocity ──────────────────────────────────────────────
     print(f"\n  [1/6] DOM velocity...")
@@ -654,6 +719,11 @@ def main():
     ap.add_argument("--leadlag_v4_dir", default="data/lead_lag_1m",
                     help="Directory of v4 tick-aggregated leader parquets "
                          "(used when --leadlag_source=v4_ticks)")
+    ap.add_argument("--max_indicator_age_days", type=int, default=7,
+                    help="Skip hl_* features entirely if indicator parquet's "
+                         "latest timestamp is older than this (days) vs the "
+                         "feature data. Prevents regime-overfit splits on a "
+                         "small valid sample. Default 7.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -705,7 +775,8 @@ def main():
             ind_path = ind_files[-1] if ind_files else None
 
             build_hl_features(f, out_path, args.config, horizons,
-                              ind_path, bn_path, cb_path, asset)
+                              ind_path, bn_path, cb_path, asset,
+                              max_indicator_age_days=args.max_indicator_age_days)
 
     elif args.minute_parquet:
         basename = os.path.basename(args.minute_parquet)
@@ -727,6 +798,7 @@ def main():
             bn_path,
             cb_path,
             asset,
+            max_indicator_age_days=args.max_indicator_age_days,
         )
     else:
         ap.print_help()
