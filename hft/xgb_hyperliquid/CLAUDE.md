@@ -16,6 +16,8 @@ The two canonical wiki documents that contain *everything* about strategy state,
 
 `xgb_pipeline_runbook.md` is the older v3 runbook — useful background but partly superseded by the wiki.
 
+`metrics_etl_pipeline.md` documents the AWS Lambda + SNS infra that produces `hyperliquid_metrics_parquet/`. Read it before touching anything in that S3 prefix, the Lambda, the watermark file, or the alerting setup.
+
 **Always read the wiki before suggesting code changes, deploys, or claims about performance.**
 
 ## Working norms (from project brief — these override generic defaults)
@@ -41,10 +43,12 @@ The full sequence is in `catorce_capital_wiki_v6.md` Section 10. Summary:
 python3 data/download_hl_data.py --all --days <MAX>
 python3 data/build_features.py --exchange hyperliquid --days <MAX>
 
-# IMPORTANT: hyperliquid_metrics_parquet/ recorder DIED on 2026-03-25.
-# The per-minute snapshots at hyperliquid_metrics_snapshots/*.json.gz are
-# alive. Use the backfill script instead of download_hl_data.py's
-# indicator path:
+# Indicators are now produced daily by the hyperliquid-daily-metrics-etl Lambda
+# (see metrics_etl_pipeline.md). hyperliquid_metrics_parquet/ is the canonical
+# source again — Mar 5 → today, continuous. download_hl_data.py's indicator path
+# works. The backfill-from-snapshots script is kept as a recovery tool for when
+# the Lambda falls behind, and as the way to (re)build a custom-range
+# day-suffix file:
 python3 data/build_indicators_from_snapshots.py --days <MAX>
 
 python3 data/download_leadlag_ticks.py --start <EARLIEST_ISO> --end <TODAY_ISO> \
@@ -139,8 +143,9 @@ HL Tier 0 Bronze + 10% HYPE staking + aligned quote 0.8x scale = 3.24 taker, 1.3
 
 - `s3://hyperliquid-orderbook/xgb_models/live_v{N}/` — model artifacts
 - `s3://hyperliquid-orderbook/deploy/xgb_bot.py`, `deploy/xgb_feature_engine.py`, `deploy/hl_fee_check.py`, `deploy/diag_hl.py`, `deploy/diag_health.py`, `deploy/build_indicators_from_snapshots.py` — code drops + diagnostics
-- `s3://hyperliquid-orderbook/hyperliquid_metrics_snapshots/dt=YYYY-MM-DD/hour=HH/*.json.gz` — alive indicator recorder (use `build_indicators_from_snapshots.py` to roll up)
-- `s3://hyperliquid-orderbook/hyperliquid_metrics_parquet/` — **stale since Mar 25**, do not use
+- `s3://hyperliquid-orderbook/hyperliquid_metrics_snapshots/dt=YYYY-MM-DD/hour=HH/*.json.gz` — raw per-minute snapshots written by `hyperliquid-metrics-fetch` Lambda
+- `s3://hyperliquid-orderbook/hyperliquid_metrics_parquet/dt=YYYY-MM-DD/data.parquet` — daily roll-up written by `hyperliquid-daily-metrics-etl` Lambda. **Healthy and continuous Mar 5 → today as of 2026-05-29.** See `metrics_etl_pipeline.md` for architecture + runbook. (Was broken Mar 25 → May 28; backfilled and alerting added.)
+- `s3://hyperliquid-orderbook/hyperliquid_metrics_parquet_backup_pre_v8_fix/dt=2026-03-25/data.parquet` — backup of the partial Mar 25 file we overwrote during the backfill. Don't touch.
 - `s3://hyperliquid-orderbook/xgb_bot/logs/` — trade logs archive
 - `s3://bitso-orderbook/data/lead_lag/{asset}_{exchange}_YYYYMMDD_HHMMSS.parquet` — Binance/Coinbase quote ticks (lead-lag source)
 
@@ -179,6 +184,6 @@ The HL wallet `0x1265c59536ee727eDB942EBF30fA1878BB659847` was leaked in an earl
 - **Don't use `COST_REAL` (4.59) in `data/targets.py` for v8+ training.** Use a custom `CostModel(3.24, 3.24, 0.0)` = 6.48 or pass `--cost ...` if `sweep_v4.py` is updated to support it. Existing `COST_WORSTCASE` happens to equal 6.48 but its name is misleading.
 - Don't reintroduce `bn_uptick_ratio` or any feature in `BANNED_EXACT`.
 - Don't add ETH-long configs to the portfolio without re-validating — they have failed holdout repeatedly in current regime (v6 didn't ship any; v7 shipped 2 but they were the second-worst contributor in live).
-- Don't read `hyperliquid_metrics_parquet/` for indicators — the upstream roll-up died 2026-03-25. Use `data/build_indicators_from_snapshots.py` against `hyperliquid_metrics_snapshots/`.
+- Don't disable or modify the `hyperliquid-daily-metrics-etl` Lambda, its EventBridge Scheduler trigger, its `RETENTION_DAYS=4` env var, or its memory (512 MB) without reading `metrics_etl_pipeline.md` first. The same applies to the SNS topic `hyperliquid-etl-alerts` and CloudWatch alarm `hyperliquid-metrics-etl-errors`.
 - Don't trust `marginSummary.accountValue` from HL API alone for equity — under Unified Account it's $0 when no perps positions are open. Sum with spot USDC (`get_equity` already does this).
 - Don't restart the bot to flip shadow↔live without a 130-min trade-off — the engine `_buffer` is in-memory only.
