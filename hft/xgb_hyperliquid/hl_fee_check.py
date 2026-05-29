@@ -155,22 +155,29 @@ def main():
     print(f"  Taker:  {rates['taker_bps']:.2f} bps")
     print(f"  Maker:  {rates['maker_bps']:.2f} bps")
 
-    # Cost model for our strategy (taker entry + maker exit)
+    # Cost model — xgb_bot.py:_exit_position calls hl_client.market_order on
+    # exit, which is a TAKER order. So the bot pays taker on BOTH sides.
+    # The "taker+maker" path is what you'd get if exit were a post-only limit,
+    # which would require non-trivial bot changes (cancel-and-replace, timeout
+    # fallback). Currently NOT what the bot does.
     rt_taker_taker = rates["taker_bps"] * 2
     rt_taker_maker = rates["taker_bps"] + rates["maker_bps"]
 
     print(f"\n  ROUND-TRIP COST MODELS:")
-    print(f"  Taker entry + Maker exit:  {rt_taker_maker:.2f} bps  (our strategy)")
-    print(f"  Taker entry + Taker exit:  {rt_taker_taker:.2f} bps  (worst case)")
+    print(f"  Taker entry + Taker exit:  {rt_taker_taker:.2f} bps  (BOT ACTUAL — market_close on exit)")
+    print(f"  Taker entry + Maker exit:  {rt_taker_maker:.2f} bps  (theoretical — would need limit-order exit)")
 
-    # Show what we assumed vs reality
-    assumed_rt = 5.4
-    actual_rt = rt_taker_maker
-    delta = assumed_rt - actual_rt
-    print(f"\n  COST MODEL COMPARISON:")
-    print(f"  Training assumption:  {assumed_rt:.2f} bps RT")
-    print(f"  Actual cost:          {actual_rt:.2f} bps RT")
-    print(f"  Hidden edge:          {delta:+.2f} bps per trade {'(conservative)' if delta > 0 else '(UNDERESTIMATED)'}")
+    # Compare bot's actual cost to what targets.py used during training.
+    # COST_REAL in targets.py = CostModel(3.24, 1.35, 0.0) = 4.59 bps RT,
+    # which assumes maker exit. The bot doesn't do that, so the trained
+    # targets were optimistic by (taker_bps - maker_bps).
+    training_rt = rates["taker_bps"] + rates["maker_bps"]  # what targets.py used
+    actual_rt = rt_taker_taker                              # what the bot pays
+    delta = training_rt - actual_rt                         # negative = training under-cost
+    print(f"\n  COST MODEL COMPARISON (training vs bot reality):")
+    print(f"  targets.py COST_REAL:      {training_rt:.2f} bps RT  (taker entry + maker exit assumption)")
+    print(f"  Bot actually pays:         {actual_rt:.2f} bps RT  (taker on both sides)")
+    print(f"  Per-trade gap:             {delta:+.2f} bps  {'(training was conservative)' if delta > 0 else '(training UNDER-costed by ' + f'{-delta:.2f}' + ' bps — real net is lower than reported)'}")
 
     # Available optimizations
     print(f"\n{'=' * 60}")
