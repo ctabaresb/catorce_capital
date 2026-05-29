@@ -13,7 +13,7 @@ import xgboost as xgb
 # v5: import lazy target computation from data/targets.py
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
-from data.targets import compute_targets, COST_REAL, TargetSpec  # noqa: E402
+from data.targets import compute_targets, COST_OBSERVED, TargetSpec  # noqa: E402
 
 warnings.filterwarnings("ignore")
 RANDOM_SEED = 42
@@ -193,11 +193,11 @@ def train_and_export(df, feature_cols, target_col, direction, horizon, out_dir, 
         "direction": direction, "horizon_m": horizon, "tp_bps": tp_bps,
         "n_features": len(feature_cols), "n_train": len(train_d),
         "base_rate": float(y_tr.mean()),
-        # v5: cost breakdown from data/targets.py::COST_REAL
-        "entry_fee_bps": COST_REAL.entry_fee_bps,
-        "exit_fee_bps": COST_REAL.exit_fee_bps,
-        "extra_buffer_bps": COST_REAL.extra_buffer_bps,
-        "rt_cost_bps": COST_REAL.rt_bps,
+        # v8: cost breakdown from data/targets.py::COST_OBSERVED (8.10 RT)
+        "entry_fee_bps": COST_OBSERVED.entry_fee_bps,
+        "exit_fee_bps": COST_OBSERVED.exit_fee_bps,
+        "extra_buffer_bps": COST_OBSERVED.extra_buffer_bps,
+        "rt_cost_bps": COST_OBSERVED.rt_bps,
         "target_version": "v5_bidask",
         "excluded": sorted(BANNED_BN_VOL),
         "train_date": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
@@ -235,9 +235,9 @@ def main():
         df["ts_min"] = pd.to_datetime(df["ts_min"], utc=True)
         print(f"  Loaded: {df.shape[0]:,} rows x {df.shape[1]} cols")
 
-        # v5: compute targets lazily — feature parquet no longer contains them
-        print(f"  Computing targets lazily with cost={COST_REAL.describe()}")
-        df = compute_targets(df, cost=COST_REAL)
+        # v8: compute targets lazily with COST_OBSERVED (8.10 bps RT)
+        print(f"  Computing targets lazily with cost={COST_OBSERVED.describe()}")
+        df = compute_targets(df, cost=COST_OBSERVED)
         print(f"  After targets: {df.shape[0]:,} rows x {df.shape[1]} cols")
 
         all_features = get_feature_columns(df)
