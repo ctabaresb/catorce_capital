@@ -1,0 +1,9 @@
+# Terraform / OpenTofu — never commit state or real var files
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.auto.tfvars
+crash.log
+crash.*.log
