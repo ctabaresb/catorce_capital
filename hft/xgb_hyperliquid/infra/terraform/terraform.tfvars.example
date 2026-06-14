@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+# terraform.tfvars must NEVER be committed.
+
+owner = "carlos"
+
+# Public address of the dedicated $50 HL experiment wallet (Part 1 of SETUP.md).
+# Not a secret. The private key is set separately via `aws ssm put-parameter`.
+experiment_wallet_address = "0xYOUR_EXPERIMENT_WALLET_ADDRESS"
+
+# Optional: pin the experiment instance to a specific subnet.
+# Empty = first subnet of the default VPC (must have internet egress).
+# experiment_subnet_id = "subnet-xxxxxxxx"
+
+# experiment_instance_type = "t3.small"
