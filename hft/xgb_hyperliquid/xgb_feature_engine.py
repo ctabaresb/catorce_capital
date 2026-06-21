@@ -912,9 +912,23 @@ class XGBFeatureEngine:
                         all_feats[f"{prefix}_d{w}m"] = vals[-1] - vals[-1-w]
 
         # ── Select only requested features ────────────────────────────
+        # Only emit features we actually computed. Previously this filled
+        # uncomputed names with 0.0, which silently fed out-of-distribution
+        # zeros to the model and made ModelConfig.predict's per-model median
+        # fallback dead code. By OMITTING names we did not compute (and any
+        # NaN/inf values), predict() falls back to the correct training
+        # median for those features. (BLOCKER-4 fix.)
         result = {}
         for f in feature_list:
-            result[f] = all_feats.get(f, 0.0)
+            v = all_feats.get(f)
+            if v is None:
+                continue  # not computed -> predict() uses the per-model median
+            try:
+                if not np.isfinite(v):
+                    continue  # NaN/inf -> predict() uses the per-model median
+            except (TypeError, ValueError):
+                continue
+            result[f] = v
 
         return result
 

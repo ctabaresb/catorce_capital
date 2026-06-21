@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-xgb_bot.py — Live XGB Trading Bot for Hyperliquid (V7 Multi-Asset)
+xgb_bot.py — Live XGB Trading Bot for Hyperliquid (V8 SOL-only)
 
-Runs 7 models across BTC, ETH, SOL:
-  BTC: long_2m_tp0 (0.86), short_1m_tp0 (0.90), short_2m_tp0 (0.86)
-  ETH: long_1m_tp0 (0.82), long_2m_tp0 (0.80)
-  SOL: long_1m_tp0 (0.80), long_1m_tp2 (0.84)
+Runs 2 models on SOL only:
+  SOL: short_1m_tp0 (0.90), short_1m_tp2 (0.84)
 
-v7 changes vs v6:
-  - Trained on Mar 5 → May 15 (71 days, includes mid-March bull, mid-May chop)
-  - Holdout on May 18-21 (all 7 ship configs profitable)
-  - Reserve confirmed on May 21-23 (the bearish window — all 7 still positive)
-  - Direction: 5L/2S (long-biased; ETH/SOL shorts didn't survive May regime)
-  - Thresholds 0.80-0.90 (higher than v6)
-  - Indicator features ALIVE (snapshot-backfilled the Mar 25 → today gap)
-  - NEW exit logic: tp_hit early-exit when net_bps >= tp_bps (captures the
-    MFE the model was trained to predict instead of waiting for horizon expiry)
-  - NEW features: trend_strength_30m, trend_strength_5m_vs_60mvol (de-trended
-    momentum, addresses "predicts vol not direction" failure mode)
+v8 changes vs v7:
+  - Trained on Mar 8 → May 22 (74d), cost=COST_OBSERVED 8.10 RT (taker+taker)
+  - Holdout on May 22-25 (3 of 4 ship configs survived)
+  - Reserve confirmed on May 25-29 (4-day window, all 3 still positive)
+  - Direction: 0L / 2S (regime flipped short-biased; longs failed holdout)
+  - BTC dropped: 0 sweep survivors at 8.10 cost
+  - ETH dropped: only marginal candidate failed resv (long 1m tp2 top resv=-1.48)
+  - Telegram chat_id read fixed (added WithDecryption=True at send_telegram)
+  - Concentration warning: both configs are sol/short/1m — effectively one
+    strategy with tp0/tp2 variants. Position sizing should reflect this.
 
 Architecture:
   Every 60s: fetch HL + Binance + Coinbase data per coin
-  → compute features → predict with 7 XGB ensembles
+  → compute features → predict with 2 XGB ensembles
   → if prediction > threshold → execute on HL
   → exit on net_bps >= tp_bps OR horizon expiry (whichever first)
 
@@ -287,8 +284,13 @@ class HLClient:
                 })
         return positions
 
-    def market_order(self, coin: str, is_buy: bool, size: float) -> dict:
-        """Place a market-like IOC order at aggressive price."""
+    def market_order(self, coin: str, is_buy: bool, size: float,
+                     reduce_only: bool = False) -> dict:
+        """Place a market-like IOC order at aggressive price.
+
+        reduce_only=True is used for EXITS so the exchange guarantees the order
+        can only reduce/flatten the position, never flip it (BLOCKER-2).
+        """
         mid = self.get_mid(coin)
         if mid <= 0:
             return {"success": False, "error": "No mid price"}
@@ -303,7 +305,7 @@ class HLClient:
                 name=coin, is_buy=is_buy, sz=sz,
                 limit_px=px,
                 order_type={"limit": {"tif": "Ioc"}},
-                reduce_only=False,
+                reduce_only=reduce_only,
             )
             return self._parse_result(result)
         except Exception as e:
@@ -365,6 +367,7 @@ class HLClient:
                 if "filled" in s:
                     return {"success": True, "filled": True,
                             "avg_px": float(s["filled"].get("avgPx", 0)),
+                            "filled_sz": float(s["filled"].get("totalSz", 0)),
                             "oid": s["filled"].get("oid")}
                 elif "resting" in s:
                     return {"success": True, "filled": False,
@@ -391,6 +394,7 @@ class Position:
     tp_bps: int = 0           # target the model trained on (net of fees)
     exit_oid: Optional[int] = None
     exit_posted_time: Optional[float] = None
+    exit_attempts: int = 0
     state: str = "open"       # open, exiting, closed
 
 
@@ -435,7 +439,7 @@ def send_telegram(text: str):
             if HAS_BOTO:
                 ssm = boto3.client("ssm", region_name="us-east-1")
                 token = ssm.get_parameter(Name="/bot/telegram/token", WithDecryption=True)["Parameter"]["Value"]
-                chat_id = ssm.get_parameter(Name="/bot/telegram/chat_id")["Parameter"]["Value"]
+                chat_id = ssm.get_parameter(Name="/bot/telegram/chat_id", WithDecryption=True)["Parameter"]["Value"]
         if token and chat_id:
             import requests
             requests.post(
@@ -454,12 +458,19 @@ def send_telegram(text: str):
 class XGBBot:
     def __init__(self, model_configs: List[ModelConfig],
                  shadow: bool = True, size_usd: float = 100.0,
-                 max_positions: int = 8, max_loss_usd: float = 50.0):
+                 max_positions: int = 8, max_loss_usd: float = 50.0,
+                 ssm_key_prefix: str = "/bot/hl",
+                 state_path: str = "xgb_bot_state.json",
+                 reconcile_mode: str = "halt"):
         self.model_configs = model_configs
         self.shadow = shadow
         self.size_usd = size_usd
         self.max_positions = max_positions
         self.max_loss_usd = max_loss_usd
+        self.ssm_key_prefix = ssm_key_prefix
+        self.state_path = state_path
+        self.reconcile_mode = reconcile_mode
+        self.traded_coins = {mc.coin for mc in model_configs}
 
         # Create one engine per unique coin across all models
         active_coins = sorted(set(mc.coin for mc in model_configs))
@@ -475,28 +486,156 @@ class XGBBot:
         self.total_trades = 0
         self.halted = False
         self.halt_reason = ""
+        self.baseline_equity: Optional[float] = None
+        self._equity_breach_count = 0
         self.cooldowns: Dict[str, float] = {}  # model_name -> last_trade_time
         self._tick_n = 0
         self._last_probs: Dict[str, float] = {}
 
         self.hl_client: Optional[HLClient] = None
 
+    def _persist_state(self):
+        """Persist risk state so a restart cannot reset the loss counter or the
+        halt flag (BLOCKER-3). Written atomically via a temp file + os.replace."""
+        try:
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "ssm_key_prefix": self.ssm_key_prefix,
+                    "cumulative_pnl": self.cumulative_pnl,
+                    "total_trades": self.total_trades,
+                    "halted": self.halted,
+                    "halt_reason": self.halt_reason,
+                    "baseline_equity": self.baseline_equity,
+                }, f)
+            os.replace(tmp, self.state_path)
+        except Exception as e:
+            logger.warning(f"state persist failed: {e}")
+
+    def _load_state(self):
+        """Restore persisted risk state on startup (BLOCKER-3)."""
+        if not os.path.exists(self.state_path):
+            return
+        try:
+            with open(self.state_path) as f:
+                st = json.load(f)
+            saved_prefix = st.get("ssm_key_prefix")
+            if saved_prefix is not None and saved_prefix != self.ssm_key_prefix:
+                logger.warning(
+                    f"State file {self.state_path} belongs to a different wallet "
+                    f"({saved_prefix} != {self.ssm_key_prefix}); ignoring it and starting "
+                    f"fresh. Use a per-wallet --state_file to avoid this."
+                )
+                return
+            self.cumulative_pnl = float(st.get("cumulative_pnl", 0.0))
+            self.total_trades = int(st.get("total_trades", 0))
+            self.halted = bool(st.get("halted", False))
+            self.halt_reason = st.get("halt_reason", "")
+            be = st.get("baseline_equity", None)
+            self.baseline_equity = float(be) if be is not None else None
+            logger.info(
+                f"Restored state: pnl=${self.cumulative_pnl:.2f} "
+                f"trades={self.total_trades} halted={self.halted} "
+                f"baseline_equity={self.baseline_equity}"
+            )
+            if self.halted:
+                logger.critical(
+                    f"Bot is HALTED from persisted state: {self.halt_reason}. "
+                    f"Delete {self.state_path} to reset after fixing the cause."
+                )
+        except Exception as e:
+            logger.warning(f"state load failed: {e}")
+
+    def _reconcile_at_startup(self):
+        """Handle positions that exist on the exchange but not in the bot's
+        (empty) in-memory state at startup, e.g. left by a crash mid-exit
+        (BLOCKER-1). Only positions in coins THIS bot trades are considered;
+        anything else on the wallet is left untouched, so we never auto-flatten
+        unrelated or manual positions on a shared wallet.
+
+        Behavior is set by reconcile_mode:
+          "halt"    (default, safe) -> refuse to start, alert, require a human.
+          "flatten" (dedicated box) -> market_close the orphan(s), then verify.
+          "off"                     -> log only and proceed (not recommended live).
+        """
+        if self.shadow or not self.hl_client:
+            return
+        try:
+            exch = self.hl_client.get_positions()
+        except Exception as e:
+            logger.error(f"Startup position reconciliation failed: {e}")
+            self.halted = True
+            self.halt_reason = "Could not read positions at startup"
+            self._persist_state()
+            send_telegram(f"HALTED: {self.halt_reason}: {e}")
+            return
+
+        orphans = [p for p in exch if p.get("coin") in self.traded_coins]
+        ignored = [p for p in exch if p.get("coin") not in self.traded_coins]
+        if ignored:
+            logger.warning(f"Leaving untouched {len(ignored)} position(s) in untraded "
+                           f"coins: {[p.get('coin') for p in ignored]}")
+        if not orphans:
+            return
+
+        if self.reconcile_mode == "off":
+            logger.warning(f"reconcile_mode=off: leaving {len(orphans)} orphan position(s) "
+                           f"in place: {orphans}")
+            return
+
+        if self.reconcile_mode == "halt":
+            self.halted = True
+            self.halt_reason = (f"{len(orphans)} pre-existing position(s) in traded coins at "
+                                f"startup; refusing to start (reconcile_mode=halt)")
+            self._persist_state()
+            logger.critical(f"HALTED: {self.halt_reason}: {orphans}")
+            send_telegram(f"HALTED: {self.halt_reason}: {orphans}")
+            return
+
+        # reconcile_mode == "flatten" (intended for the dedicated capped box)
+        logger.critical(f"reconcile_mode=flatten: flattening {len(orphans)} orphan "
+                        f"position(s): {orphans}")
+        send_telegram(f"WARNING: flattening {len(orphans)} orphan position(s) at startup.")
+        for ep in orphans:
+            try:
+                self.hl_client.market_close(ep["coin"])
+            except Exception as e:
+                logger.error(f"Failed to flatten {ep.get('coin')}: {e}")
+        time.sleep(2)
+        try:
+            still = [p for p in self.hl_client.get_positions()
+                     if p.get("coin") in self.traded_coins]
+        except Exception:
+            still = None
+        if still:
+            self.halted = True
+            self.halt_reason = "Could not flatten pre-existing positions at startup"
+            self._persist_state()
+            logger.critical(f"HALTED: {self.halt_reason}: {still}")
+            send_telegram(f"HALTED: {self.halt_reason}: {still}")
+
     def initialize(self):
         """Load models and connect to HL."""
         for mc in self.model_configs:
             mc.load()
+
+        # Restore persisted risk state before anything can trade (BLOCKER-3).
+        self._load_state()
 
         if not self.shadow:
             if not HAS_HL:
                 logger.error("hyperliquid-python-sdk not installed. Cannot trade live.")
                 sys.exit(1)
 
-            # Load credentials from SSM
+            # Load credentials from SSM. The prefix is configurable so the
+            # capped experiment box reads /agent/hl/* (its IAM role hard-denies
+            # /bot/*), while the production bot reads /bot/hl/* (BLOCKER-6).
             if HAS_BOTO:
                 ssm = boto3.client("ssm", region_name="us-east-1")
-                pk = ssm.get_parameter(Name="/bot/hl/private_key",
+                pk = ssm.get_parameter(Name=f"{self.ssm_key_prefix}/private_key",
                                         WithDecryption=True)["Parameter"]["Value"]
-                wa = ssm.get_parameter(Name="/bot/hl/wallet_address")["Parameter"]["Value"]
+                wa = ssm.get_parameter(
+                    Name=f"{self.ssm_key_prefix}/wallet_address")["Parameter"]["Value"]
             else:
                 pk = os.environ.get("HL_PRIVATE_KEY", "")
                 wa = os.environ.get("HL_WALLET_ADDRESS", "")
@@ -508,6 +647,22 @@ class XGBBot:
             if equity < 10:
                 logger.error(f"Equity ${equity:.2f} too low. Need at least $10.")
                 sys.exit(1)
+
+            # Establish the loss baseline ONCE (persisted) so the equity stop
+            # survives restarts instead of re-baselining to a depleted balance.
+            if self.baseline_equity is None:
+                self.baseline_equity = equity
+                logger.info(f"Loss baseline set to ${self.baseline_equity:.2f} "
+                            f"(halt if equity <= ${self.baseline_equity - self.max_loss_usd:.2f})")
+            else:
+                logger.info(f"Loss baseline (restored): ${self.baseline_equity:.2f} "
+                            f"(halt if equity <= ${self.baseline_equity - self.max_loss_usd:.2f})")
+            self._persist_state()
+
+            # Flatten any pre-existing/orphan positions before trading (e.g.
+            # left open by a crash mid-exit) so we never run on top of an
+            # unmanaged position (BLOCKER-1 reconciliation).
+            self._reconcile_at_startup()
 
         mode = "SHADOW" if self.shadow else "LIVE"
         msg = (f"XGB Bot STARTED [{mode}]\n"
@@ -563,6 +718,38 @@ class XGBBot:
 
         if self.halted:
             return
+
+        # Equity-based circuit breaker (BLOCKER-3): independent of the
+        # estimate-based PnL counter and robust across restarts because the
+        # baseline is persisted. Reads REAL account equity each tick.
+        if not self.shadow and self.hl_client and self.baseline_equity is not None:
+            try:
+                eq = self.hl_client.get_equity()
+                floor = self.baseline_equity - self.max_loss_usd
+                if eq <= 0:
+                    # Implausible read (transient API / Unified-Account quirk).
+                    # Do NOT halt on a single bad read; log and reset the counter.
+                    logger.warning(f"equity read implausible (${eq:.2f}); skipping equity stop this tick")
+                    self._equity_breach_count = 0
+                elif eq <= floor:
+                    # Require 2 consecutive sub-floor reads to avoid a transient
+                    # blip latching a permanent false halt.
+                    self._equity_breach_count += 1
+                    logger.warning(f"equity ${eq:.2f} <= floor ${floor:.2f} "
+                                   f"(breach {self._equity_breach_count}/2)")
+                    if self._equity_breach_count >= 2:
+                        self.halted = True
+                        self.halt_reason = (f"Equity stop: ${eq:.2f} <= floor ${floor:.2f} "
+                                            f"(baseline ${self.baseline_equity:.2f} - "
+                                            f"max_loss ${self.max_loss_usd:.2f})")
+                        self._persist_state()
+                        logger.critical(f"HALTED: {self.halt_reason}")
+                        send_telegram(f"HALTED: {self.halt_reason}")
+                        return
+                else:
+                    self._equity_breach_count = 0
+            except Exception as e:
+                logger.warning(f"equity stop check failed: {e}")
 
         # 1. Fetch data for all coins
         try:
@@ -714,17 +901,24 @@ class XGBBot:
 
             if result.get("success") and result.get("filled"):
                 fill_px = result.get("avg_px", mid)
-                logger.info(f"  FILLED: {mc.direction} {size_coin:.6f} {mc.coin} @ ${fill_px:.2f}")
+                # Record the ACTUAL filled size, not the requested size: a
+                # partial IOC fill recorded at full size would later cause an
+                # over-sized exit (BLOCKER-2).
+                fill_sz = result.get("filled_sz") or size_coin
+                if fill_sz <= 0:
+                    logger.error("  Order reported filled but size=0; not tracking position")
+                    return
+                logger.info(f"  FILLED: {mc.direction} {fill_sz:.6f} {mc.coin} @ ${fill_px:.2f}")
                 self.positions.append(Position(
                     model_name=mc.name, direction=mc.direction,
                     coin=mc.coin, entry_time=now, entry_px=fill_px,
-                    size=size_coin, horizon_m=mc.horizon_m,
+                    size=fill_sz, horizon_m=mc.horizon_m,
                     tp_bps=mc.tp_bps,
                     state="open",
                 ))
                 send_telegram(
                     f"{'BUY' if is_buy else 'SELL'} {mc.name} [{mc.coin}]\n"
-                    f"Size: {size_coin:.6f} {mc.coin} (${self.size_usd:.0f})\n"
+                    f"Size: {fill_sz:.6f} {mc.coin} (${self.size_usd:.0f})\n"
                     f"Price: ${fill_px:.2f}\n"
                     f"Prob: {prob:.4f}"
                 )
@@ -772,52 +966,126 @@ class XGBBot:
             elif hold_minutes >= pos.horizon_m * 3:
                 self._exit_position(pos, mid, "max_hold_expiry")
 
+    def _handle_failed_exit(self, pos: Position, reason: str, result: dict):
+        """An exit order did not confirm. Keep the position OPEN and retry on the
+        next tick, escalate to market_close ONCE, and HALT if it still can't be
+        resolved. Bounded so it can never spam orders/alerts forever (R2)."""
+        pos.exit_attempts += 1
+        err = result.get("error", "unknown")
+        logger.error(
+            f"EXIT FAILED {pos.model_name} [{pos.coin}] reason={reason} "
+            f"attempt={pos.exit_attempts}: {err}. Position STILL OPEN."
+        )
+        if pos.exit_attempts == 1:
+            send_telegram(
+                f"EXIT FAILED {pos.model_name} [{pos.coin}]: {err}. "
+                f"Position STILL OPEN, retrying."
+            )
+        # One escalation via the SDK's market_close, then verify flat.
+        if pos.exit_attempts == 3:
+            logger.critical(f"Escalating to market_close for {pos.coin}")
+            try:
+                self.hl_client.market_close(pos.coin)
+            except Exception as e:
+                logger.error(f"market_close escalation failed: {e}")
+            time.sleep(1)
+            try:
+                still_open = any(
+                    p.get("coin") == pos.coin for p in self.hl_client.get_positions()
+                )
+            except Exception:
+                still_open = True
+            if not still_open:
+                pos.state = "closed"
+                self._persist_state()
+                logger.warning(f"{pos.coin} confirmed flat after market_close escalation")
+                send_telegram(f"{pos.model_name} [{pos.coin}] flattened via market_close.")
+                return
+        # Give up after a bounded number of attempts: stop trading and alert.
+        if pos.exit_attempts >= 5:
+            self.halted = True
+            self.halt_reason = (f"Exit repeatedly failed for {pos.model_name} "
+                                f"[{pos.coin}] after {pos.exit_attempts} attempts")
+            self._persist_state()
+            logger.critical(f"HALTED: {self.halt_reason}")
+            send_telegram(f"HALTED: {self.halt_reason}")
+
     def _exit_position(self, pos: Position, current_mid: float, reason: str):
-        """Exit a position and log the trade."""
+        """Exit a position and log the trade.
+
+        Correctness contract (BLOCKER-1/2): in live mode the close order is
+        placed FIRST and the trade is only booked (PnL, counters, log,
+        state=closed) on a CONFIRMED fill. A failed or unconfirmed exit leaves
+        the position OPEN to be retried on the next tick and alerts; it is never
+        silently marked closed. The exit is reduce_only so it can never flip the
+        side, and the booked size is the actual filled size.
+        """
         now = time.time()
+        # Cost: exit goes through market_order (taker). Real RT cost is taker on
+        # both sides for BTC/ETH/SOL aligned perps = 6.48 bps. See CLAUDE.md.
+        cost_bps = 6.48
 
         if current_mid <= 0:
-            current_mid = pos.entry_px  # Fallback
+            current_mid = pos.entry_px  # Fallback for bps math only
 
-        # Compute P&L
-        if pos.direction == "long":
-            gross_bps = (current_mid / (pos.entry_px + 1e-12) - 1) * 1e4
-        else:
-            gross_bps = (pos.entry_px / (current_mid + 1e-12) - 1) * 1e4
-
-        # Cost: bot's _exit_position uses self.hl_client.market_order (taker).
-        # Real RT cost is TAKER on both sides for BTC/ETH/SOL aligned perps:
-        #   taker per side = base 4.5 bps × 0.9 (10% staking) × 0.8 (aligned) = 3.24 bps
-        #   RT = 3.24 × 2 = 6.48 bps
-        # (Theoretical taker+maker would be 4.59 bps, but exit is market_close
-        # not a limit, so we pay taker both sides. Activating the 4% referral
-        # would drop this to 6.22 bps RT.)
-        cost_bps = 6.48
-        net_bps = gross_bps - cost_bps
-        pnl_usd = net_bps / 1e4 * self.size_usd
-
-        pos.state = "closed"
+        exit_px = current_mid
+        booked_sz = pos.size       # size we book PnL on this call
+        partial_remainder = 0.0    # unfilled size to keep open, if any
 
         if not self.shadow and self.hl_client:
-            # Place market close
-            is_buy_exit = (pos.direction == "short")  # Buy to close short
-            result = self.hl_client.market_order(pos.coin, is_buy_exit, pos.size)
-            if result.get("success") and result.get("filled"):
-                actual_exit_px = result.get("avg_px", current_mid)
-                # Recalculate with actual exit price
-                if pos.direction == "long":
-                    gross_bps = (actual_exit_px / (pos.entry_px + 1e-12) - 1) * 1e4
-                else:
-                    gross_bps = (pos.entry_px / (actual_exit_px + 1e-12) - 1) * 1e4
-                net_bps = gross_bps - cost_bps
-                pnl_usd = net_bps / 1e4 * self.size_usd
-                current_mid = actual_exit_px
+            requested_sz = pos.size
+            pos.state = "exiting"
+            is_buy_exit = (pos.direction == "short")  # buy to close a short
+            result = self.hl_client.market_order(
+                pos.coin, is_buy_exit, requested_sz, reduce_only=True
+            )
+            if not (result.get("success") and result.get("filled")):
+                # Exit did NOT confirm. Do not book PnL, do not mark closed.
+                # Keep the position OPEN; retry next tick (bounded + escalates).
+                self._handle_failed_exit(pos, reason, result)
+                return
+            # Confirmed (possibly partial) fill: use the real exit price + size.
+            exit_px = result.get("avg_px") or current_mid
+            filled_sz = result.get("filled_sz")
+            if not filled_sz or filled_sz <= 0:
+                filled_sz = requested_sz  # size missing -> assume full
+            booked_sz = min(filled_sz, requested_sz)
+            if booked_sz < requested_sz * 0.999:
+                # Partial close: book the filled part, keep the remainder OPEN.
+                partial_remainder = requested_sz - booked_sz
+            pos.exit_attempts = 0  # a fill resets the failure counter
 
+        # ---- Reached only on a confirmed (full/partial) fill, or shadow ----
+        if pos.direction == "long":
+            gross_bps = (exit_px / (pos.entry_px + 1e-12) - 1) * 1e4
+        else:
+            gross_bps = (pos.entry_px / (exit_px + 1e-12) - 1) * 1e4
+        net_bps = gross_bps - cost_bps
+        # PnL on the ACTUAL filled notional, not the requested size_usd.
+        notional = booked_sz * pos.entry_px if booked_sz > 0 else self.size_usd
+        pnl_usd = net_bps / 1e4 * notional
+
+        if partial_remainder > 0:
+            # Keep the position open with the unfilled remainder; retry next tick.
+            pos.size = partial_remainder
+            pos.state = "exiting"
+            logger.warning(
+                f"PARTIAL EXIT {pos.model_name} [{pos.coin}]: booked {booked_sz:.6f}, "
+                f"{partial_remainder:.6f} still open, will retry."
+            )
+            send_telegram(
+                f"PARTIAL EXIT {pos.model_name} [{pos.coin}]: "
+                f"{partial_remainder:.6f} {pos.coin} still open, retrying."
+            )
+        else:
+            pos.size = booked_sz
+            pos.state = "closed"
         hold_min = (now - pos.entry_time) / 60.0
 
-        # Update risk state
+        # Update + persist risk state (BLOCKER-3)
         self.cumulative_pnl += pnl_usd
         self.total_trades += 1
+        self._persist_state()
 
         # Log
         self.trade_log.log(
@@ -826,8 +1094,8 @@ class XGBBot:
             direction=pos.direction,
             coin=pos.coin,
             entry_px=f"{pos.entry_px:.2f}",
-            exit_px=f"{current_mid:.2f}",
-            size_usd=f"{self.size_usd:.2f}",
+            exit_px=f"{exit_px:.2f}",
+            size_usd=f"{notional:.2f}",
             gross_bps=f"{gross_bps:+.2f}",
             net_bps=f"{net_bps:+.2f}",
             pnl_usd=f"{pnl_usd:+.6f}",
@@ -839,24 +1107,25 @@ class XGBBot:
         emoji = "+" if net_bps > 0 else "-"
         logger.info(
             f"EXIT [{emoji}] {pos.model_name}: "
-            f"entry=${pos.entry_px:.2f} exit=${current_mid:.2f} "
+            f"entry=${pos.entry_px:.2f} exit=${exit_px:.2f} "
             f"net={net_bps:+.2f}bps pnl=${pnl_usd:+.4f} "
             f"hold={hold_min:.1f}m reason={reason}"
         )
 
         if not self.shadow:
             send_telegram(
-                f"{'✅' if net_bps > 0 else '❌'} EXIT: {pos.model_name}\n"
+                f"{'WIN' if net_bps > 0 else 'LOSS'} EXIT: {pos.model_name}\n"
                 f"Net: {net_bps:+.2f} bps\n"
                 f"PnL: ${pnl_usd:+.4f}\n"
                 f"Hold: {hold_min:.0f}m\n"
                 f"Cum: ${self.cumulative_pnl:+.4f} ({self.total_trades} trades)"
             )
 
-        # Risk check
+        # Estimate-based stop (second layer; the equity stop in _tick is primary)
         if self.cumulative_pnl < -self.max_loss_usd:
             self.halted = True
-            self.halt_reason = f"Max loss ${self.max_loss_usd} exceeded"
+            self.halt_reason = f"Max loss ${self.max_loss_usd} exceeded (estimated PnL)"
+            self._persist_state()
             logger.critical(f"HALTED: {self.halt_reason}")
             send_telegram(f"HALTED: {self.halt_reason}")
 
@@ -885,6 +1154,19 @@ class XGBBot:
 # Main
 # ---------------------------------------------------------------------------
 
+def _positive_finite(s: str) -> float:
+    """argparse type for risk params: reject nan/inf/non-positive so a hostile
+    or buggy caller can't disable the loss stops (e.g. --max_loss nan makes the
+    halt comparisons always-False). Defense-in-depth alongside the launcher."""
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"not a number: {s!r}")
+    if not math.isfinite(v) or v <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive finite number: {s!r}")
+    return v
+
+
 def main():
     ap = argparse.ArgumentParser(description="XGB Live Trading Bot")
     mode = ap.add_mutually_exclusive_group()
@@ -892,12 +1174,21 @@ def main():
                       help="Shadow mode: predict + log, no real orders (default)")
     mode.add_argument("--live", action="store_true",
                       help="Live mode: real orders on Hyperliquid")
-    ap.add_argument("--size", type=float, default=100,
+    ap.add_argument("--size", type=_positive_finite, default=100,
                     help="Position size in USD per trade (default $100)")
-    ap.add_argument("--models_dir", default="models/live_v7",
+    ap.add_argument("--models_dir", default="models/live_v8",
                     help="Directory containing model subdirectories")
-    ap.add_argument("--max_loss", type=float, default=50,
+    ap.add_argument("--max_loss", type=_positive_finite, default=50,
                     help="Max cumulative loss before halt (USD)")
+    ap.add_argument("--ssm_key_prefix", default="/bot/hl",
+                    help="SSM path prefix for HL private_key + wallet_address. "
+                         "Use /agent/hl on the capped experiment box (BLOCKER-6).")
+    ap.add_argument("--state_file", default="xgb_bot_state.json",
+                    help="Path to persisted risk state (cumulative PnL, halt, "
+                         "loss baseline). Survives restarts (BLOCKER-3).")
+    ap.add_argument("--reconcile", choices=["halt", "flatten", "off"], default="halt",
+                    help="Startup handling of pre-existing positions in traded coins: "
+                         "halt (safe default), flatten (dedicated capped box only), off.")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
 
@@ -915,48 +1206,21 @@ def main():
 
     shadow = not args.live
 
-    # Define model configs (V7: holdout-validated on May 18-21, reserve-
-    # confirmed on May 21-23 bearish window). 7 models: 5L/2S, both shorts
-    # are BTC. Thresholds 0.80-0.90. See retrain_no_bnvol.py MODEL_DEFS for
+    # Define model configs (V8: holdout-validated on May 22-25, reserve-
+    # confirmed on May 25-29 4-day window). 2 models: 0L/2S, both SOL.
+    # Thresholds from longresv val_thr. See retrain_no_bnvol.py MODEL_DEFS for
     # the canonical list and holdout metrics.
     model_configs = [
-        # BTC (3): 1 long + 2 short
+        # SOL (2): 0 long + 2 short
         ModelConfig(
-            name="btc_long_2m_tp0",
-            direction="long", horizon_m=2, threshold=0.86, coin="BTC",
-            model_dir=os.path.join(args.models_dir, "btc", "long_2m_tp0"),
+            name="sol_short_1m_tp0",
+            direction="short", horizon_m=1, threshold=0.90, coin="SOL",
+            model_dir=os.path.join(args.models_dir, "sol", "short_1m_tp0"),
         ),
         ModelConfig(
-            name="btc_short_1m_tp0",
-            direction="short", horizon_m=1, threshold=0.90, coin="BTC",
-            model_dir=os.path.join(args.models_dir, "btc", "short_1m_tp0"),
-        ),
-        ModelConfig(
-            name="btc_short_2m_tp0",
-            direction="short", horizon_m=2, threshold=0.86, coin="BTC",
-            model_dir=os.path.join(args.models_dir, "btc", "short_2m_tp0"),
-        ),
-        # ETH (2): 2 long
-        ModelConfig(
-            name="eth_long_1m_tp0",
-            direction="long", horizon_m=1, threshold=0.82, coin="ETH",
-            model_dir=os.path.join(args.models_dir, "eth", "long_1m_tp0"),
-        ),
-        ModelConfig(
-            name="eth_long_2m_tp0",
-            direction="long", horizon_m=2, threshold=0.80, coin="ETH",
-            model_dir=os.path.join(args.models_dir, "eth", "long_2m_tp0"),
-        ),
-        # SOL (2): 2 long
-        ModelConfig(
-            name="sol_long_1m_tp0",
-            direction="long", horizon_m=1, threshold=0.80, coin="SOL",
-            model_dir=os.path.join(args.models_dir, "sol", "long_1m_tp0"),
-        ),
-        ModelConfig(
-            name="sol_long_1m_tp2",
-            direction="long", horizon_m=1, threshold=0.84, coin="SOL",
-            model_dir=os.path.join(args.models_dir, "sol", "long_1m_tp2"),
+            name="sol_short_1m_tp2",
+            direction="short", horizon_m=1, threshold=0.84, tp_bps=2, coin="SOL",
+            model_dir=os.path.join(args.models_dir, "sol", "short_1m_tp2"),
         ),
     ]
 
@@ -979,6 +1243,9 @@ def main():
         shadow=shadow,
         size_usd=args.size,
         max_loss_usd=args.max_loss,
+        ssm_key_prefix=args.ssm_key_prefix,
+        state_path=args.state_file,
+        reconcile_mode=args.reconcile,
     )
 
     bot.initialize()
