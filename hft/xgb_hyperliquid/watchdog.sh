@@ -9,6 +9,18 @@ PIDFILE="$BOTDIR/xgb_bot.pid"
 STALE_LOG_SEC=300       # 5 min — safe with per-tick heartbeat
 MAX_AGE_SEC=21600       # 6 hours proactive
 
+# --- Bot launch config: single source of truth (override via env or bot.env) ---
+# Previously the launch line hardcoded `--models_dir models/live_v3 --size 50`,
+# which did NOT match the v8 MODEL_DEFS (sol/short_1m_tp0, sol/short_1m_tp2), so
+# every restart hit the dir-check and exited 1 -> bot never came back. Fixed to
+# live_v8 and parameterized so size/max_loss/models live in ONE place.
+[ -f "$BOTDIR/bot.env" ] && . "$BOTDIR/bot.env"
+MODELS_DIR="${XGB_MODELS_DIR:-models/live_v8}"   # the ONLY change forced by the bug fix (live_v3 lacks short_1m_tp0)
+SIZE="${XGB_SIZE:-50}"                    # PRIOR production value, preserved; override via bot.env
+MAX_LOSS="${XGB_MAX_LOSS:-30}"            # PRIOR production value, preserved; override via bot.env
+SSM_PREFIX="${XGB_SSM_PREFIX:-/bot/hl}"   # production wallet; experiment box uses the launcher instead
+RECONCILE="${XGB_RECONCILE:-halt}"        # refuse to start on an orphan position (safer than trading on top); see note
+
 [ -f "$HALT_FILE" ] && exit 0
 
 # Kill switch detection
@@ -63,7 +75,9 @@ if [ "$NEED_RESTART" = "1" ]; then
     rm -f "$PIDFILE"
     screen -wipe 2>/dev/null
     cd "$BOTDIR"
-    screen -dmS xgb_bot python3.12 -u xgb_bot.py --live --size 50 --max_loss 30 --models_dir models/live_v3
+    screen -dmS xgb_bot python3.12 -u xgb_bot.py --live \
+        --size "$SIZE" --max_loss "$MAX_LOSS" --models_dir "$MODELS_DIR" \
+        --ssm_key_prefix "$SSM_PREFIX" --reconcile "$RECONCILE"
 fi
 
 # Monitor restart
