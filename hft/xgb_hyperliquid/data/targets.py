@@ -95,6 +95,16 @@ COST_REAL = CostModel(3.24, 1.35, 0.0)          # 4.59 bps RT (theoretical taker
 COST_CONSERVATIVE = CostModel(3.24, 1.35, 0.81) # 5.40 bps RT (v3-era buffer)
 COST_WORSTCASE = CostModel(3.24, 3.24, 0.0)     # 6.48 bps RT (taker+taker with aligned scale — bot actual)
 COST_OBSERVED = CostModel(4.05, 4.05, 0.0)      # 8.10 bps RT (taker+taker, no aligned scale — v8 conservative)
+# Dual-cost presets for the capped-live experiment (staking-discount problem):
+#   - COST_STAKED     → "would this be profitable on my real (staked) account?"
+#                       selection + bot decisions train/select against it.
+#   - COST_EXPERIMENT → the real net P&L of the $50 unstaked experiment wallet
+#                       (tracking only; never a KEEP/selection criterion).
+# CONFIRM both against the live wallets before trusting them:
+#   python3 hl_fee_check.py --wallet <STAKED_MAIN_ADDR>             -> COST_STAKED
+#   python3 hl_fee_check.py --wallet 0x3eFAa0aE...F803  (experiment) -> COST_EXPERIMENT
+COST_STAKED = COST_OBSERVED                     # 8.10 bps RT — production (staked) account; selection + bot decisions
+COST_EXPERIMENT = CostModel(4.5, 4.5, 0.0)      # 9.00 bps RT — unstaked tier-0 experiment wallet (CONFIRM via hl_fee_check)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
