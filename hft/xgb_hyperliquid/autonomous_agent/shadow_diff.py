@@ -367,7 +367,12 @@ def run_diff(capture_glob, models_dir, train_dir, template, out_prefix,
         if n_samp < min_aligned:
             verdict = "INSUFFICIENT-DATA"
         elif gw_sev < SEV_OK:
-            verdict = "OK"
+            # dist mode is blind to per-minute decorrelation (same distribution,
+            # broken correspondence) — the exact v3/v5/v7 failure mode. So its
+            # best verdict is NEVER a clean deploy-clearance; it only means "no
+            # gross distributional drift / fallback". A real GO needs --align
+            # minute against a training parquet covering the capture window.
+            verdict = "OK-DIST-ONLY" if align == "dist" else "OK"
         elif gw_sev < SEV_CAUTION:
             verdict = "CAUTION"
         else:
@@ -404,11 +409,12 @@ def _write_report(df, summaries, out_prefix, align):
 
     lines = ["# Shadow-diff report (train vs live feature divergence)", ""]
     if align == "dist":
-        lines.append("Alignment mode: **dist** (distribution comparison). Catches median-fallback "
-                     "rate, center/scale drift, and out-of-distribution rate; does NOT catch a "
-                     "subtle per-minute value/sign drift when the two distributions happen to "
-                     "match. For that gold-standard check use `--align minute` with a training "
-                     "parquet covering the capture window.")
+        lines.append("> **WARNING — dist mode CANNOT clear a model for deploy.** It is blind to "
+                     "per-minute decorrelation: a feature can share training's distribution yet be "
+                     "completely wrong minute-to-minute (same dist, broken correspondence) — the "
+                     "EXACT failure mode behind v3/v5/v7 live losses — and still score `OK-DIST-ONLY`. "
+                     "Use dist only as a pre-screen for gross drift / median-fallback. A real GO "
+                     "requires `--align minute` against a training parquet that covers the capture window.")
     else:
         lines.append("Alignment mode: **minute** (per-minute matched). Catches per-minute value "
                      "AND sign divergence; requires a training parquet overlapping the capture "
