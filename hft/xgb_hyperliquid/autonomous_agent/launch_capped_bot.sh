@@ -119,12 +119,15 @@ echo "$(date -u +%FT%TZ) launch_capped_bot: size=$size (req=$req_size cap=$MAX_S
      "max_loss=$loss (req=$req_loss cap=$MAX_LOSS_USD) models=$real_models prefix=$SSM_KEY_PREFIX reconcile=flatten" >&2
 
 # exec so the supervisor (systemd) owns the bot process directly.
+# --cost_bps 9.00: this box trades the UNSTAKED $50 experiment wallet (Rabby),
+# RT taker+taker = 2 x 4.50 bps. (Prod staked wallet is 8.10; watchdog sets that.)
 exec "$PY" -u xgb_bot.py --live \
   --size "$size" \
   --max_loss "$loss" \
   --models_dir "$real_models" \
   --ssm_key_prefix "$SSM_KEY_PREFIX" \
   --reconcile flatten \
+  --cost_bps 9.00 \
   --state_file "$STATE_FILE"
 
 # ---------------------------------------------------------------------------
