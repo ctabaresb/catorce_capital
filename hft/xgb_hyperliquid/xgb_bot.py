@@ -461,12 +461,21 @@ class XGBBot:
                  max_positions: int = 8, max_loss_usd: float = 50.0,
                  ssm_key_prefix: str = "/bot/hl",
                  state_path: str = "xgb_bot_state.json",
-                 reconcile_mode: str = "halt"):
+                 reconcile_mode: str = "halt",
+                 cost_bps: float = 9.0):
         self.model_configs = model_configs
         self.shadow = shadow
         self.size_usd = size_usd
         self.max_positions = max_positions
         self.max_loss_usd = max_loss_usd
+        # RT cost the bot books per round trip (taker entry + taker exit). Both
+        # legs are market (IOC marketable-limit) orders = taker. Measured fees:
+        #   staked (Metamask, prod):   2 x 4.05 bps = 8.10
+        #   unstaked (Rabby, $50 expt): 2 x 4.50 bps = 9.00
+        # Default 9.00 (conservative): a forgotten flag over-counts cost, which
+        # is the SAFE direction (less booked profit, kill-switch trips earlier).
+        # Must match the cost the model set was TRAINED at (meta.json rt_cost_bps).
+        self.cost_bps = cost_bps
         self.ssm_key_prefix = ssm_key_prefix
         self.state_path = state_path
         self.reconcile_mode = reconcile_mode
@@ -954,7 +963,7 @@ class XGBBot:
                     gross_bps = (mid / (pos.entry_px + 1e-12) - 1) * 1e4
                 else:
                     gross_bps = (pos.entry_px / (mid + 1e-12) - 1) * 1e4
-                net_bps_est = gross_bps - 6.48  # RT taker+taker, matches _exit_position
+                net_bps_est = gross_bps - self.cost_bps  # RT taker+taker, matches _exit_position
                 if net_bps_est >= pos.tp_bps:
                     self._exit_position(pos, mid, "tp_hit")
                     continue
@@ -1021,9 +1030,10 @@ class XGBBot:
         side, and the booked size is the actual filled size.
         """
         now = time.time()
-        # Cost: exit goes through market_order (taker). Real RT cost is taker on
-        # both sides for BTC/ETH/SOL aligned perps = 6.48 bps. See CLAUDE.md.
-        cost_bps = 6.48
+        # Cost: both entry and exit go through market_order = taker. RT taker+taker
+        # = self.cost_bps (8.10 staked / 9.00 unstaked; see __init__). Must equal
+        # the cost the live model set was trained against (meta.json rt_cost_bps).
+        cost_bps = self.cost_bps
 
         if current_mid <= 0:
             current_mid = pos.entry_px  # Fallback for bps math only
@@ -1180,6 +1190,11 @@ def main():
                     help="Directory containing model subdirectories")
     ap.add_argument("--max_loss", type=_positive_finite, default=50,
                     help="Max cumulative loss before halt (USD)")
+    ap.add_argument("--cost_bps", type=_positive_finite, default=9.0,
+                    help="RT taker+taker cost in bps the bot books per trade. "
+                         "8.10 = staked prod wallet, 9.00 = unstaked $50 experiment "
+                         "wallet. MUST match the live models' meta.json rt_cost_bps. "
+                         "Default 9.00 (conservative).")
     ap.add_argument("--ssm_key_prefix", default="/bot/hl",
                     help="SSM path prefix for HL private_key + wallet_address. "
                          "Use /agent/hl on the capped experiment box (BLOCKER-6).")
@@ -1246,6 +1261,7 @@ def main():
         ssm_key_prefix=args.ssm_key_prefix,
         state_path=args.state_file,
         reconcile_mode=args.reconcile,
+        cost_bps=args.cost_bps,
     )
 
     bot.initialize()

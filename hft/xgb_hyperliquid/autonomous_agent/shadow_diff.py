@@ -8,33 +8,36 @@ divergence: tick features approximated from REST trades (vs S3 quote ticks in
 training), features the live engine never computes (now surfaced as NaN by the
 engine, i.e. median-fallback), and silent value drift on same-named features.
 
-It joins, per (coin, ts_min):
-  - LIVE capture  : shadow_capture.py parquet (the engine's per-minute output)
-  - TRAIN rebuild : data/artifacts_xgb/xgb_features_hyperliquid_{asset}_*.parquet
-and reports, per feature:
-  - pct_median_fallback_live : fraction of aligned minutes the engine did NOT
-    compute it (NaN in capture) -> the model saw the training median, not a live value
-  - mean_abs_diff, rel_diff   : magnitude of value drift where both are present
-  - corr_live_train           : linear agreement of the two series
-  - bias                      : mean(live - train)
-  - frac_sign_flip            : fraction of minutes the sign disagrees
-all WEIGHTED by each model's XGBoost gain importance, so the headline number is
-"what fraction of a model's predictive mass sits on features that diverge live."
+Two alignment modes (a live capture taken NOW does NOT share wall-clock minutes
+with a historical training parquet, so a plain timestamp join would be empty):
 
-For lead-lag families (bn_*, cb_*) it also tests a T-vs-(T-1) alignment, since
-the live engine can lag training by a minute; the better-correlated lag is used
-so a pure timing offset is not mis-scored as divergence.
+  --align dist  (DEFAULT) — distribution comparison, no timestamp overlap needed.
+      Per feature: median-fallback rate (NaN in capture), center shift (in train
+      IQRs), scale drift, out-of-distribution rate. Catches the dominant failure
+      modes (engine-never-computes, scale/shift, OOD). Misses a subtle per-minute
+      drift when the two distributions happen to match.
 
-NOTE: this cannot be run end-to-end until a real shadow_capture parquet exists
-(capture needs a ~130-min warm run on a box). Use --self_test to exercise the
-metric math on synthetic data.
+  --align minute — per-minute matched on (coin, ts_min). Catches per-minute value
+      AND sign divergence. REQUIRES a training parquet that COVERS the capture
+      window: build one with data/build_features_hl_xgb.py over the capture days
+      and pass it via --train_parquet. If windows don't overlap it errors loudly
+      with instructions (it does NOT silently produce an empty report).
+
+Both report, per feature, a [0,1] severity WEIGHTED by each model's XGBoost gain
+importance, so the headline is "what fraction of a model's predictive mass sits
+on features that diverge live." Verdict bands: OK / CAUTION / DO-NOT-DEPLOY, and
+INSUFFICIENT-DATA when there aren't enough live samples.
 
 USAGE
+  # Default: works against the existing training parquet + a fresh capture.
   python3 autonomous_agent/shadow_diff.py \
       --capture 'data/shadow_capture/shadow_capture_SOL_*.parquet' \
-      --models_dir models/live_v8 \
-      --train_dir data/artifacts_xgb \
+      --models_dir models/live_v8 --train_dir data/artifacts_xgb \
       --out data/shadow_capture/shadow_diff_report
+
+  # Gold-standard, after rebuilding a training parquet over the capture days:
+  python3 autonomous_agent/shadow_diff.py --align minute \
+      --capture '...SOL_*.parquet' --train_parquet data/artifacts_xgb/<covering>.parquet
 
   python3 autonomous_agent/shadow_diff.py --self_test
 """
@@ -159,6 +162,67 @@ def _all_nan_like(df):
 
 
 # ---------------------------------------------------------------------------
+# Distribution metrics (NO timestamp overlap required)
+#
+# The minute-matched path above needs live capture and training to share
+# wall-clock minutes. A live capture taken NOW vs a historical training parquet
+# never overlaps, so the default comparison is distribution-level: it asks "are
+# the live feature DISTRIBUTIONS in the same place/shape as training, and how
+# often does the engine fall back to medians?" This catches the dominant failure
+# modes (engine-never-computes, scale/shift drift, out-of-distribution live
+# values) without needing a same-window training parquet. It does NOT catch a
+# subtle per-minute value/sign drift when the two distributions happen to match
+# — use --align minute (with a training parquet covering the capture window) for
+# that gold-standard check.
+# ---------------------------------------------------------------------------
+
+def feature_dist_metrics(live, train_col):
+    """Distribution-level divergence for ONE feature. `live` is the capture
+    Series (NaN = engine fallback); `train_col` is the training reference."""
+    import numpy as np
+    n = int(len(live))
+    pct_fallback = float(live.isna().mean()) if n else 1.0
+    lv = live.dropna().astype(float).to_numpy()
+    tv = train_col.dropna().astype(float).to_numpy()
+    n_live = int(lv.size)
+    if n_live == 0 or tv.size < 10:
+        return dict(n_live=n_live, pct_fallback=pct_fallback,
+                    center_shift=float("nan"), scale_ratio=float("nan"),
+                    ood_rate=float("nan"))
+    t_p01, t_p25, t_med, t_p75, t_p99 = np.percentile(tv, [1, 25, 50, 75, 99])
+    l_p25, l_med, l_p75 = np.percentile(lv, [25, 50, 75])
+    t_iqr = t_p75 - t_p25
+    l_iqr = l_p75 - l_p25
+    denom = abs(t_iqr) + 1e-9
+    center_shift = float(abs(l_med - t_med) / denom)          # in train IQRs
+    scale_ratio = float((abs(l_iqr) + 1e-12) / denom)         # ~1 if same spread
+    ood_rate = float(np.mean((lv < t_p01) | (lv > t_p99)))    # baseline ~0.02
+    return dict(n_live=n_live, pct_fallback=pct_fallback,
+                center_shift=center_shift, scale_ratio=scale_ratio,
+                ood_rate=ood_rate)
+
+
+def dist_severity(m, min_live=MIN_N_BOTH):
+    """[0,1] distribution severity, same convex shape as the minute severity:
+    pf*1 + (1-pf)*value_severity, where value_severity blends center shift (in
+    train IQRs), scale drift (decades), and out-of-distribution rate. A feature
+    scaled/shifted (perfect corr, but catastrophic for a tree model) scores high
+    here via center_shift + scale + OOD."""
+    pf = m["pct_fallback"]
+    nl = m.get("n_live", 0)
+    cs, sr, ood = m["center_shift"], m["scale_ratio"], m["ood_rate"]
+    if nl == 0 or cs is None or (isinstance(cs, float) and math.isnan(cs)):
+        return 1.0 if pf >= 0.999 else max(pf, 0.5)
+    center_term = min(1.0, cs / 2.0)                          # >=2 IQR shift = max
+    scale_term = min(1.0, abs(math.log10(sr + 1e-12)))        # 1 decade off = max
+    ood_term = min(1.0, max(0.0, (ood - 0.02) / 0.30))        # >=32% OOD = max
+    val_sev = min(1.0, 0.40 * center_term + 0.35 * scale_term + 0.25 * ood_term)
+    if nl < min_live and pf < 1.0:
+        val_sev = max(val_sev, 0.5)   # too few live samples to call it safe
+    return min(1.0, pf + (1.0 - pf) * val_sev)
+
+
+# ---------------------------------------------------------------------------
 # Model gain importance
 # ---------------------------------------------------------------------------
 
@@ -210,8 +274,8 @@ def find_train_parquet(coin, train_dir, template):
 
 
 def run_diff(capture_glob, models_dir, train_dir, template, out_prefix,
+             align="dist", train_parquet=None,
              min_n_both=MIN_N_BOTH, min_aligned=MIN_ALIGNED):
-    import numpy as np
     import pandas as pd
 
     cap_paths = sorted(glob.glob(capture_glob))
@@ -220,55 +284,77 @@ def run_diff(capture_glob, models_dir, train_dir, template, out_prefix,
     cap = pd.concat([pd.read_parquet(p) for p in cap_paths], ignore_index=True)
     cap["ts_min"] = pd.to_datetime(cap["ts_min"], utc=True)
     coins = sorted(cap["coin"].astype(str).str.upper().unique())
-    print(f"[shadow_diff] capture: {len(cap)} rows, coins={coins}, files={len(cap_paths)}")
+    cap_lo, cap_hi = cap["ts_min"].min(), cap["ts_min"].max()
+    print(f"[shadow_diff] capture: {len(cap)} rows, coins={coins}, "
+          f"window {cap_lo} .. {cap_hi}, align={align}")
 
     models = load_models_gain(models_dir)
-    # Per-feature max gain across models (for ranking) and the model lists.
     feat_gain_max = {}
     for mname, mv in models.items():
         for f, g in mv["gain"].items():
             feat_gain_max[f] = max(feat_gain_max.get(f, 0.0), g)
     eval_feats = sorted(set().union(*[set(mv["features"]) for mv in models.values()]))
 
-    rows = []  # per (coin, feature)
-    coin_aligned = {}
+    rows = []                # per (coin, feature)
+    coin_samples = {}        # count the per-model verdict trusts (overlap mins / live rows)
     for coin in coins:
-        tp = find_train_parquet(coin, train_dir, template)
-        if not tp:
+        tp = train_parquet or find_train_parquet(coin, train_dir, template)
+        if not tp or not os.path.exists(tp):
             print(f"[shadow_diff] WARN no training parquet for {coin}; skipping")
             continue
         tr = pd.read_parquet(tp)
         tr["ts_min"] = pd.to_datetime(tr["ts_min"], utc=True)
         tr = tr.drop_duplicates("ts_min", keep="last").set_index("ts_min").sort_index()
+        tr_lo, tr_hi = tr.index.min(), tr.index.max()
         cc = cap[cap["coin"].astype(str).str.upper() == coin].copy()
         cc = cc.drop_duplicates("ts_min", keep="last").set_index("ts_min").sort_index()
-        common = cc.index.intersection(tr.index)
-        coin_aligned[coin] = len(common)
-        print(f"[shadow_diff] {coin}: train={tp.split('/')[-1]} aligned_minutes={len(common)}")
-        if len(common) == 0:
-            print(f"[shadow_diff] WARN {coin}: no overlapping minutes between capture and training window")
-            continue
-        live_idxed = cc.loc[common]
-        train_idxed = tr.loc[common]
-        train_lag1 = tr.copy()
-        train_lag1.index = train_lag1.index + pd.Timedelta(minutes=1)
 
-        for feat in eval_feats:
-            m = metrics_with_leadlag(feat, live_idxed, train_idxed, train_lag1)
-            if m is None:
+        if align == "minute":
+            common = cc.index.intersection(tr.index)
+            coin_samples[coin] = len(common)
+            print(f"[shadow_diff] {coin}: train={os.path.basename(tp)} "
+                  f"train_window {tr_lo} .. {tr_hi} overlap_minutes={len(common)}")
+            if len(common) == 0:
+                # Loud, actionable: do NOT silently produce an empty report.
+                print(f"[shadow_diff] ERROR {coin}: --align minute needs a training parquet that "
+                      f"COVERS the capture window ({cap_lo} .. {cap_hi}), but this training data "
+                      f"ends {tr_hi}. Rebuild a training parquet over the capture days "
+                      f"(data/build_features_hl_xgb.py) and pass it via --train_parquet, OR use "
+                      f"--align dist (distribution comparison, no overlap needed).")
                 continue
-            m.update(coin=coin, feature=feat, gain_max=feat_gain_max.get(feat, 0.0),
-                     sev=severity(m, min_n_both))
-            rows.append(m)
+            live_idxed = cc.loc[common]
+            train_idxed = tr.loc[common]
+            train_lag1 = tr.copy()
+            train_lag1.index = train_lag1.index + pd.Timedelta(minutes=1)
+            for feat in eval_feats:
+                m = metrics_with_leadlag(feat, live_idxed, train_idxed, train_lag1)
+                if m is None:
+                    continue
+                m.update(coin=coin, feature=feat, mode="minute",
+                         gain_max=feat_gain_max.get(feat, 0.0), sev=severity(m, min_n_both))
+                rows.append(m)
+        else:  # align == "dist"  (default)
+            coin_samples[coin] = len(cc)
+            print(f"[shadow_diff] {coin}: train={os.path.basename(tp)} "
+                  f"train_window {tr_lo} .. {tr_hi} live_rows={len(cc)} (distribution comparison)")
+            for feat in eval_feats:
+                if feat not in tr.columns:
+                    continue   # training doesn't have it; can't form a reference distribution
+                live_col = cc[feat] if feat in cc.columns else _all_nan_like(cc)
+                m = feature_dist_metrics(live_col, tr[feat])
+                m.update(coin=coin, feature=feat, mode="dist",
+                         gain_max=feat_gain_max.get(feat, 0.0), sev=dist_severity(m, min_n_both))
+                rows.append(m)
 
     if not rows:
-        raise SystemExit("[shadow_diff] no comparable (coin, feature) rows produced")
+        raise SystemExit("[shadow_diff] no comparable (coin, feature) rows produced — check that "
+                         "capture and training share coins, and (for --align minute) that the "
+                         "training parquet covers the capture window")
 
     df = pd.DataFrame(rows)
     df["gain_weighted_sev"] = df["gain_max"] * df["sev"]
     df = df.sort_values("gain_weighted_sev", ascending=False).reset_index(drop=True)
 
-    # Per-model summary
     summaries = []
     for mname, mv in models.items():
         coin = _model_coin(mname)
@@ -277,22 +363,27 @@ def run_diff(capture_glob, models_dir, train_dir, template, out_prefix,
         # An un-comparable gain-bearing feature defaults to MAX severity (1.0):
         # a feature we cannot even compare is not safe.
         gw_sev = float(sum(mv["gain"][f] * _lookup(sub, f, "sev", 1.0) for f in mv["gain"]))
-        n_aligned = coin_aligned.get(coin, 0)
-        if n_aligned < min_aligned:
+        n_samp = coin_samples.get(coin, 0)
+        if n_samp < min_aligned:
             verdict = "INSUFFICIENT-DATA"
         elif gw_sev < SEV_OK:
-            verdict = "OK"
+            # dist mode is blind to per-minute decorrelation (same distribution,
+            # broken correspondence) — the exact v3/v5/v7 failure mode. So its
+            # best verdict is NEVER a clean deploy-clearance; it only means "no
+            # gross distributional drift / fallback". A real GO needs --align
+            # minute against a training parquet covering the capture window.
+            verdict = "OK-DIST-ONLY" if align == "dist" else "OK"
         elif gw_sev < SEV_CAUTION:
             verdict = "CAUTION"
         else:
             verdict = "DO-NOT-DEPLOY"
         top = sub.sort_values("gain_weighted_sev", ascending=False).head(5)
-        summaries.append(dict(model=mname, coin=coin, n_aligned=n_aligned,
+        summaries.append(dict(model=mname, coin=coin, n_samples=n_samp, align=align,
                               gain_weighted_fallback_pct=round(100 * gw_fallback, 2),
                               gain_weighted_severity=round(gw_sev, 4), verdict=verdict,
                               top_diverging=list(top["feature"])))
 
-    _write_report(df, summaries, out_prefix)
+    _write_report(df, summaries, out_prefix, align)
     return df, summaries
 
 
@@ -310,42 +401,65 @@ def _lookup(sub, feat, col, default):
     return default if (v is None or (isinstance(v, float) and math.isnan(v))) else v
 
 
-def _write_report(df, summaries, out_prefix):
-    import pandas as pd
+def _write_report(df, summaries, out_prefix, align):
     os.makedirs(os.path.dirname(out_prefix) or ".", exist_ok=True)
     csv_path = out_prefix + ".csv"
     md_path = out_prefix + ".md"
     df.to_csv(csv_path, index=False)
 
     lines = ["# Shadow-diff report (train vs live feature divergence)", ""]
-    lines.append("Heuristic gain-weighted severity bands: "
-                 f"OK < {SEV_OK} <= CAUTION < {SEV_CAUTION} <= DO-NOT-DEPLOY. "
-                 "Calibrate against real shadow->live PnL.")
+    if align == "dist":
+        lines.append("> **WARNING — dist mode CANNOT clear a model for deploy.** It is blind to "
+                     "per-minute decorrelation: a feature can share training's distribution yet be "
+                     "completely wrong minute-to-minute (same dist, broken correspondence) — the "
+                     "EXACT failure mode behind v3/v5/v7 live losses — and still score `OK-DIST-ONLY`. "
+                     "Use dist only as a pre-screen for gross drift / median-fallback. A real GO "
+                     "requires `--align minute` against a training parquet that covers the capture window.")
+    else:
+        lines.append("Alignment mode: **minute** (per-minute matched). Catches per-minute value "
+                     "AND sign divergence; requires a training parquet overlapping the capture "
+                     "window.")
+    lines.append("")
+    lines.append(f"Gain-weighted severity bands: OK < {SEV_OK} <= CAUTION < {SEV_CAUTION} <= "
+                 "DO-NOT-DEPLOY. Heuristic — calibrate against real shadow->live PnL.")
     lines.append("")
     lines.append("## Per-model verdict")
     lines.append("")
-    lines.append("| model | coin | aligned min | gain-wtd fallback % | gain-wtd severity | verdict | top diverging (high gain) |")
+    lines.append("| model | coin | samples | gain-wtd fallback % | gain-wtd severity | verdict | top diverging (high gain) |")
     lines.append("|---|---|---:|---:|---:|---|---|")
     for s in summaries:
-        lines.append(f"| {s['model']} | {s['coin']} | {s['n_aligned']} | {s['gain_weighted_fallback_pct']} | "
+        lines.append(f"| {s['model']} | {s['coin']} | {s['n_samples']} | {s['gain_weighted_fallback_pct']} | "
                      f"{s['gain_weighted_severity']} | {s['verdict']} | {', '.join(s['top_diverging'])} |")
     lines.append("")
     lines.append("## Top 25 features by gain-weighted severity")
     lines.append("")
-    lines.append("| coin | feature | gain | n_both | fallback% | corr | mean_abs_diff | rel_diff | sign_flip% | lag | severity |")
-    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for _, r in df.head(25).iterrows():
-        lines.append(
-            f"| {r['coin']} | {r['feature']} | {r['gain_max']:.4f} | {int(r['n_both'])} | "
-            f"{100*r['pct_fallback']:.1f} | {_fmt(r['corr'])} | {_fmt(r['mean_abs_diff'])} | "
-            f"{_fmt(r['rel_diff'])} | {_fmt(100*r['frac_sign_flip'])} | {int(r.get('leadlag_lag',0))} | "
-            f"{r['sev']:.3f} |")
+    if align == "dist":
+        lines.append("| coin | feature | gain | n_live | fallback% | center_shift(IQR) | scale_ratio | ood% | severity |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+        for _, r in df.head(25).iterrows():
+            lines.append(
+                f"| {r['coin']} | {r['feature']} | {r['gain_max']:.4f} | {int(r.get('n_live', 0))} | "
+                f"{100*r['pct_fallback']:.1f} | {_fmt(r.get('center_shift'))} | {_fmt(r.get('scale_ratio'))} | "
+                f"{_fmt(100*_nan(r.get('ood_rate')))} | {r['sev']:.3f} |")
+    else:
+        lines.append("| coin | feature | gain | n_both | fallback% | corr | mean_abs_diff | rel_diff | sign_flip% | lag | severity |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for _, r in df.head(25).iterrows():
+            lines.append(
+                f"| {r['coin']} | {r['feature']} | {r['gain_max']:.4f} | {int(r.get('n_both', 0))} | "
+                f"{100*r['pct_fallback']:.1f} | {_fmt(r.get('corr'))} | {_fmt(r.get('mean_abs_diff'))} | "
+                f"{_fmt(r.get('rel_diff'))} | {_fmt(100*_nan(r.get('frac_sign_flip')))} | "
+                f"{int(r.get('leadlag_lag', 0))} | {r['sev']:.3f} |")
     with open(md_path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"[shadow_diff] wrote {csv_path} and {md_path}")
     print("\n".join(f"  {s['model']}: {s['verdict']} "
                     f"(gain-wtd severity {s['gain_weighted_severity']}, "
                     f"fallback {s['gain_weighted_fallback_pct']}%)" for s in summaries))
+
+
+def _nan(v):
+    return float("nan") if v is None else v
 
 
 def _fmt(v):
@@ -405,7 +519,21 @@ def self_test():
     g = {"a": 2.0, "b": 2.0}
     tot = sum(g.values()); g = {k: v/tot for k, v in g.items()}
     assert abs(sum(g.values()) - 1.0) < 1e-9
-    print("[self_test] OK — fallback, sign-flip, VALUE-DRIFT, full-fallback, low-n, gain-norm all behave.")
+
+    # 8) DISTRIBUTION mode (the join-fix): no timestamp overlap needed.
+    md = feature_dist_metrics(train.copy(), train)            # identical dist
+    assert dist_severity(md) < 0.10, ("dist identical", dist_severity(md), md)
+    md = feature_dist_metrics(100.0 * train + 50.0, train)    # scale+shift drift
+    assert dist_severity(md) > 0.6, ("dist value drift not caught", dist_severity(md), md)
+    md = feature_dist_metrics(pd.Series(np.nan, index=idx), train)  # full fallback
+    assert dist_severity(md) == 1.0, ("dist full fallback", dist_severity(md))
+    lf = train.copy(); lf.iloc[:140] = np.nan                  # 70% fallback
+    md = feature_dist_metrics(lf, train)
+    assert abs(md["pct_fallback"] - 0.70) < 0.02 and dist_severity(md) > 0.65, ("dist fallback", md)
+    md_low = feature_dist_metrics(train.iloc[:10].copy(), train)  # too few live samples
+    assert dist_severity(md_low, min_live=30) >= 0.5, ("dist low-n floor", dist_severity(md_low, 30))
+    print("[self_test] OK — minute metrics (fallback/sign-flip/value-drift/full-fallback/low-n) "
+          "AND distribution metrics (identical/drift/fallback/low-n) all behave.")
 
 
 def main():
@@ -417,10 +545,17 @@ def main():
                     help="glob template per asset (the most recent match is used)")
     ap.add_argument("--out", default=os.path.join(HFT_DIR, "data", "shadow_capture", "shadow_diff_report"),
                     help="output prefix (.csv + .md are written)")
+    ap.add_argument("--align", choices=["dist", "minute"], default="dist",
+                    help="dist = distribution comparison (default; no timestamp overlap needed). "
+                         "minute = per-minute matched (needs a training parquet covering the capture window)")
+    ap.add_argument("--train_parquet", default=None,
+                    help="explicit training parquet to compare against (overrides auto-pick); "
+                         "in practice required for --align minute over a fresh capture window")
     ap.add_argument("--min_aligned", type=int, default=MIN_ALIGNED,
-                    help="min aligned minutes before a per-model verdict is trusted (else INSUFFICIENT-DATA)")
+                    help="min samples (overlap minutes in 'minute' mode, live rows in 'dist' mode) "
+                         "before a per-model verdict is trusted (else INSUFFICIENT-DATA)")
     ap.add_argument("--min_n_both", type=int, default=MIN_N_BOTH,
-                    help="min comparable minutes before a feature's value-drift terms are trusted")
+                    help="min comparable samples before a feature's value-drift terms are trusted")
     ap.add_argument("--self_test", action="store_true", help="run synthetic metric checks and exit")
     args = ap.parse_args()
 
@@ -430,6 +565,7 @@ def main():
     if not args.capture:
         ap.error("--capture is required (or use --self_test)")
     run_diff(args.capture, args.models_dir, args.train_dir, args.train_template, args.out,
+             align=args.align, train_parquet=args.train_parquet,
              min_n_both=args.min_n_both, min_aligned=args.min_aligned)
     return 0
 

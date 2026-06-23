@@ -20,6 +20,7 @@ SIZE="${XGB_SIZE:-50}"                    # PRIOR production value, preserved; o
 MAX_LOSS="${XGB_MAX_LOSS:-30}"            # PRIOR production value, preserved; override via bot.env
 SSM_PREFIX="${XGB_SSM_PREFIX:-/bot/hl}"   # production wallet; experiment box uses the launcher instead
 RECONCILE="${XGB_RECONCILE:-halt}"        # refuse to start on an orphan position (safer than trading on top); see note
+COST_BPS="${XGB_COST_BPS:-8.10}"          # staked prod wallet RT taker+taker (2 x 4.05). MUST match models' meta rt_cost_bps
 
 [ -f "$HALT_FILE" ] && exit 0
 
@@ -77,7 +78,7 @@ if [ "$NEED_RESTART" = "1" ]; then
     cd "$BOTDIR"
     screen -dmS xgb_bot python3.12 -u xgb_bot.py --live \
         --size "$SIZE" --max_loss "$MAX_LOSS" --models_dir "$MODELS_DIR" \
-        --ssm_key_prefix "$SSM_PREFIX" --reconcile "$RECONCILE"
+        --ssm_key_prefix "$SSM_PREFIX" --reconcile "$RECONCILE" --cost_bps "$COST_BPS"
 fi
 
 # Monitor restart
